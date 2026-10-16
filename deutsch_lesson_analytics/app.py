@@ -12,6 +12,13 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 
+def _sanitize_json(text: str) -> str:
+    # убираем trailing commas перед } или ]
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    # убираем возможные однострочные комментарии
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
+
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audio"
@@ -305,6 +312,11 @@ def run_ai_analysis(lesson_id):
 понимание на слух, беглость, вопрос, трудность, замечание, прогресс, другое).
 Пиши описание и рекомендации на русском. Цитаты evidence должны точно совпадать
 с транскриптом. Если говорящий не является преподавателем, используй его имя как student_name.
+выведи столько ошибок, сколько сможешь найти, не сокращяй их количество
+Верни ТОЛЬКО валидный JSON (RFC 8259).
+Запрещено: trailing commas, комментарии, одинарные кавычки.
+Перед отправкой мысленно проверь, что JSON парсится.
+
 Возвращай только JSON по схеме:
 {{
  "lesson_summary": "краткая сводка на русском",
@@ -336,9 +348,9 @@ def run_ai_analysis(lesson_id):
         giga = GigaChat(
             credentials=credentials,
             base_url="https://api.giga.chat/v1",
-            model=MODEL_NAME,
+            model="GigaChat-3-Ultra",
             verify_ssl_certs=False,
-            max_tokens=8192
+            max_tokens=20000
         )
         logger.info("Клиент GigaChat создан успешно.")
     except Exception:
@@ -370,7 +382,9 @@ def run_ai_analysis(lesson_id):
         if not json_match:
             logger.error("В ответе модели не найден JSON. Полный ответ:\n%s", content)
             return False, "Не удалось извлечь JSON из ответа модели."
-        payload = json.loads(json_match.group(0))
+        raw_json = json_match.group(0)
+        raw_json = _sanitize_json(raw_json)
+        payload = json.loads(raw_json)
         observations = payload.get("observations", [])
         logger.info("JSON успешно распарсен. Наблюдений: %d", len(observations))
     except json.JSONDecodeError:
