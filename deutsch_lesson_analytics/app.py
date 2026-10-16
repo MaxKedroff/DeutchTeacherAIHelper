@@ -95,9 +95,53 @@ st.markdown("""
         display: inline-block; padding: .12rem .5rem; border-radius: 999px;
         font-size: .76rem; margin-left: .35rem;
     }
-    .hw-badge.ok {background: rgba(76,175,80,.18); color: #2e7d32;}
+        .hw-badge.ok {background: rgba(76,175,80,.18); color: #2e7d32;}
     .hw-badge.bad {background: rgba(217,83,79,.18); color: #b71c1c;}
     .hw-badge.pending {background: rgba(255,193,7,.20); color: #8d6e00;}
+
+    /* Ежедневник */
+    .week-grid {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: .55rem;
+    }
+    .day-col {
+        border: 1px solid rgba(120,120,120,.18);
+        border-radius: 12px;
+        padding: .5rem .55rem;
+        background: rgba(120,130,140,.04);
+        min-height: 220px;
+    }
+    .day-col.today {
+        border-color: #4871b8;
+        box-shadow: 0 0 0 2px rgba(72,113,184,.15) inset;
+    }
+    .day-head {
+        font-weight: 600;
+        font-size: .9rem;
+        margin-bottom: .35rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+    }
+    .day-head .wd {opacity: .65; font-weight: 400; font-size: .8rem;}
+    .evt {
+        border-left: 4px solid #4871b8;
+        background: rgba(72,113,184,.10);
+        border-radius: 8px;
+        padding: .35rem .5rem;
+        margin-bottom: .35rem;
+        font-size: .82rem;
+        line-height: 1.25;
+    }
+    .evt .t {opacity: .7; font-size: .75rem;}
+    .evt.done {border-left-color: #4caf50; background: rgba(76,175,80,.10);}
+    .evt.overdue {border-left-color: #d9534f; background: rgba(217,83,79,.10);}
+    .evt .grp {font-weight: 600; display: block;}
+    .evt .ttl {display: block; margin-top: .1rem;}
+    .day-empty {
+        opacity: .5; font-size: .8rem; text-align: center; padding: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -427,6 +471,23 @@ def get_upcoming_planned(days_ahead=14, group_id=None):
         return con.execute(sql, params).fetchall()
 
 
+def get_planned_in_range(start_date: date, end_date: date, group_id=None):
+    """Возвращает карточки занятий в диапазоне [start_date; end_date] включительно."""
+    with db() as con:
+        params = [start_date.isoformat(), (end_date + timedelta(days=1)).isoformat()]
+        sql = """
+            SELECT pl.*, g.name AS group_name
+            FROM planned_lessons pl
+            JOIN groups g ON g.id = pl.group_id
+            WHERE date(pl.scheduled_at) >= ? AND date(pl.scheduled_at) < ?
+        """
+        if group_id:
+            sql += " AND pl.group_id = ?"
+            params.append(group_id)
+        sql += " ORDER BY pl.scheduled_at"
+        return con.execute(sql, params).fetchall()
+
+
 def update_planned(planned_id, **fields):
     if not fields:
         return
@@ -590,8 +651,8 @@ init_db()
 
 # ---------- Боковая навигация ----------
 # ---------- Боковая навигация ----------
-PAGES = ["Обзор", "Добавить урок", "Календарь", "Уроки и транскрипты",
-         "Группы", "Ученики", "Аналитика"]
+PAGES = ["Обзор", "Добавить урок", "Календарь", "Ежедневник",
+         "Уроки и транскрипты", "Группы", "Ученики", "Аналитика"]
 
 if "nav" not in st.session_state:
     st.session_state["nav"] = "Обзор"
@@ -921,6 +982,198 @@ elif page == "Календарь":
 
             st.divider()
 
+# =====================================================================
+#                              ЕЖЕДНЕВНИК
+# =====================================================================
+elif page == "Ежедневник":
+    st.markdown("## Ежедневник")
+    st.caption("Недельный или дневной вид занятий по группам — как в календаре.")
+
+    groups = list_groups()
+    if not groups:
+        st.info("Сначала создайте группы и расписание во вкладке «Группы».")
+    else:
+        # ---- Панель управления: группа, режим, дата ----
+        # ---- Служебное состояние (не привязано к виджетам!) ----
+        if "diary_ref" not in st.session_state:
+            st.session_state["diary_ref"] = date.today()
+        if "diary_date_widget" not in st.session_state:
+            st.session_state["diary_date_widget"] = st.session_state["diary_ref"]
+
+
+        def _diary_sync_from_widget():
+            """Пользователь выбрал дату в date_input — обновляем эталон."""
+            st.session_state["diary_ref"] = st.session_state["diary_date_widget"]
+
+
+        def _diary_set(d):
+            """Программно меняем эталон и виджет ДО их отрисовки."""
+            st.session_state["diary_ref"] = d
+            st.session_state["diary_date_widget"] = d
+
+
+        # ---- Панель управления: группа, режим, дата ----
+        top1, top2, top3 = st.columns([2, 2, 2])
+        with top1:
+            group_options = {"Все группы": None} | {g["name"]: g["id"] for g in groups}
+            group_label = st.selectbox("Группа", list(group_options.keys()),
+                                       key="diary_group")
+            group_filter = group_options[group_label]
+        with top2:
+            view_mode = st.radio("Вид", ["Неделя", "День"],
+                                 horizontal=True, key="diary_view")
+        with top3:
+            # date_input пишет в отдельный ключ, синхронизация — через on_change
+            st.date_input(
+                "Дата",
+                value=st.session_state["diary_date_widget"],
+                key="diary_date_widget",
+                on_change=_diary_sync_from_widget,
+            )
+
+        ref_date = st.session_state["diary_ref"]
+
+        # ---- Навигация стрелками ----
+        nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+        delta = timedelta(days=7 if view_mode == "Неделя" else 1)
+        if nav1.button("← Предыдущая", key="diary_prev", use_container_width=True):
+            _diary_set(ref_date - delta)
+            st.rerun()
+        if nav2.button("Сегодня", key="diary_today", use_container_width=True):
+            _diary_set(date.today())
+            st.rerun()
+        nav3.markdown(
+            f"<div style='text-align:center; padding-top:.35rem; opacity:.75'>"
+            f"{ref_date.strftime('%d.%m.%Y')} · {WEEKDAYS_RU[ref_date.weekday()]}</div>",
+            unsafe_allow_html=True
+        )
+        if nav4.button("Следующая →", key="diary_next", use_container_width=True):
+            _diary_set(ref_date + delta)
+            st.rerun()
+        if nav5.button("🔄 Обновить", key="diary_refresh", use_container_width=True):
+            for g in groups:
+                if group_filter is None or g["id"] == group_filter:
+                    upsert_planned_lessons_for_window(g["id"], days_ahead=180)
+            st.rerun()
+
+        st.divider()
+
+        # ---- Считаем диапазон ----
+        if view_mode == "Неделя":
+            monday = ref_date - timedelta(days=ref_date.weekday())
+            sunday = monday + timedelta(days=6)
+            range_start, range_end = monday, sunday
+        else:
+            range_start = range_end = ref_date
+
+        # материализуем карточки, чтобы окно точно было заполнено
+        for g in groups:
+            if group_filter is None or g["id"] == group_filter:
+                upsert_planned_lessons_for_window(g["id"], days_ahead=180)
+
+        planned = get_planned_in_range(range_start, range_end, group_id=group_filter)
+
+        # группируем по дате
+        by_day = {}
+        for pl in planned:
+            d = datetime.fromisoformat(pl["scheduled_at"]).date()
+            by_day.setdefault(d, []).append(pl)
+
+        def _event_html(pl):
+            dt = datetime.fromisoformat(pl["scheduled_at"])
+            hw = homework_state(pl)
+            cls = "evt"
+            if pl["is_conducted"]:
+                cls += " done"
+            if hw == "overdue":
+                cls += " overdue"
+            title = pl["title"] or "— без темы —"
+            hw_marks = ""
+            if hw == "overdue":
+                hw_marks = " 🔴"
+            elif hw == "ok":
+                hw_marks = " ✅"
+            elif hw == "pending":
+                hw_marks = " 🟡"
+            return (
+                f'<div class="{cls}">'
+                f'<span class="t">{dt.strftime("%H:%M")}</span>'
+                f'<span class="grp">{pl["group_name"]}</span>'
+                f'<span class="ttl">{title}{hw_marks}</span>'
+                f'</div>'
+            )
+
+        # ---- Отрисовка ----
+        if view_mode == "Неделя":
+            days = [range_start + timedelta(days=i) for i in range(7)]
+            cols = st.columns(7)
+            today = date.today()
+            for i, d in enumerate(days):
+                with cols[i]:
+                    head_cls = "day-col today" if d == today else "day-col"
+                    st.markdown(
+                        f'<div class="{head_cls}">'
+                        f'<div class="day-head">'
+                        f'<span>{d.strftime("%d.%m")}</span>'
+                        f'<span class="wd">{WEEKDAYS_RU[d.weekday()]}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+                    items = by_day.get(d, [])
+                    if not items:
+                        st.markdown('<div class="day-empty">—</div>',
+                                    unsafe_allow_html=True)
+                    else:
+                        for pl in items:
+                            st.markdown(_event_html(pl), unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            # День — карточки детальнее
+            items = by_day.get(ref_date, [])
+            if not items:
+                st.info("На этот день занятий нет.")
+            for pl in items:
+                dt = datetime.fromisoformat(pl["scheduled_at"])
+                hw = homework_state(pl)
+                border_color = "#4871b8"
+                if pl["is_conducted"]:
+                    border_color = "#4caf50"
+                if hw == "overdue":
+                    border_color = "#d9534f"
+                hw_label = {
+                    "ok": '<span class="hw-badge ok">Домашка сдана</span>',
+                    "overdue": '<span class="hw-badge bad">Домашка просрочена</span>',
+                    "pending": '<span class="hw-badge pending">Ожидается</span>',
+                    "none": "",
+                }[hw]
+                st.markdown(
+                    f"""<div class="cal-card" style="border-left-color:{border_color}">
+                    <h4>{pl['title'] or '— без темы —'}</h4>
+                    <div class="cal-meta">{pl['group_name']} · {dt.strftime('%H:%M')}
+                    · {'проведено' if pl['is_conducted'] else 'запланировано'}
+                    · {'подготовлено' if pl['is_prepared'] else 'не подготовлено'}
+                    {hw_label}</div>
+                    </div>""",
+                    unsafe_allow_html=True
+                )
+
+            # сводка по домашка
+            if items:
+                st.markdown("### Домашка на этот день")
+                for pl in items:
+                    if not pl["homework_due_date"]:
+                        continue
+                    hw_rows = get_homework_rows(pl["id"])
+                    if not hw_rows:
+                        continue
+                    st.markdown(f"**{pl['title'] or '— без темы —'}** · "
+                                f"дедлайн {pl['homework_due_date']}")
+                    for hw in hw_rows:
+                        mark = "✅" if hw["is_done"] else "⬜"
+                        st.markdown(f"- {mark} {hw['student_name']}")
+
+        st.divider()
+        st.caption("Полный чек-лист занятия (тема, подготовка, домашка) — во вкладке «Календарь».")
 
 # =====================================================================
 #                          УРОКИ И ТРАНСКРИПТЫ
