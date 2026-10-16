@@ -95,7 +95,7 @@ st.markdown("""
         display: inline-block; padding: .12rem .5rem; border-radius: 999px;
         font-size: .76rem; margin-left: .35rem;
     }
-        .hw-badge.ok {background: rgba(76,175,80,.18); color: #2e7d32;}
+    .hw-badge.ok {background: rgba(76,175,80,.18); color: #2e7d32;}
     .hw-badge.bad {background: rgba(217,83,79,.18); color: #b71c1c;}
     .hw-badge.pending {background: rgba(255,193,7,.20); color: #8d6e00;}
 
@@ -200,7 +200,6 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
-        -- NEW: группы, состав групп, расписание
         CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -216,16 +215,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS group_schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-            weekday INTEGER NOT NULL,           -- 0=Пн ... 6=Вс
-            start_time TEXT NOT NULL,           -- "HH:MM"
+            weekday INTEGER NOT NULL,
+            start_time TEXT NOT NULL,
             duration_min INTEGER DEFAULT 60
         );
 
-        -- NEW: экземпляры занятий (карточки календаря)
         CREATE TABLE IF NOT EXISTS planned_lessons (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-            scheduled_at TEXT NOT NULL,         -- ISO datetime
+            scheduled_at TEXT NOT NULL,
             title TEXT DEFAULT '',
             topic TEXT DEFAULT '',
             is_prepared INTEGER DEFAULT 0,
@@ -235,7 +233,6 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
-        -- NEW: статус домашки по каждому студенту
         CREATE TABLE IF NOT EXISTS homework_status (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             planned_lesson_id INTEGER NOT NULL REFERENCES planned_lessons(id) ON DELETE CASCADE,
@@ -347,7 +344,7 @@ def get_lesson_list():
         """, con)
 
 
-# ---------- НОВОЕ: группы ----------
+# ---------- Группы ----------
 def list_groups():
     with db() as con:
         return con.execute("SELECT * FROM groups ORDER BY name COLLATE NOCASE").fetchall()
@@ -375,7 +372,6 @@ def delete_group(group_id):
 
 
 def set_group_schedule(group_id, schedule_rows):
-    """schedule_rows: list of (weekday:int, 'HH:MM', duration_min:int)"""
     with db() as con:
         con.execute("DELETE FROM group_schedule WHERE group_id=?", (group_id,))
         for wd, tm, dur in schedule_rows:
@@ -419,12 +415,8 @@ def get_all_students():
         ).fetchall()
 
 
-# ---------- НОВОЕ: календарь занятий ----------
+# ---------- Календарь занятий ----------
 def upsert_planned_lessons_for_window(group_id, days_ahead=60):
-    """
-    Материализует карточки занятий по расписанию группы на N дней вперёд
-    (если их ещё нет).
-    """
     sched = get_group_schedule(group_id)
     if not sched:
         return
@@ -472,7 +464,6 @@ def get_upcoming_planned(days_ahead=14, group_id=None):
 
 
 def get_planned_in_range(start_date: date, end_date: date, group_id=None):
-    """Возвращает карточки занятий в диапазоне [start_date; end_date] включительно."""
     with db() as con:
         params = [start_date.isoformat(), (end_date + timedelta(days=1)).isoformat()]
         sql = """
@@ -533,9 +524,6 @@ def set_homework_done(planned_id, student_id, done):
 
 
 def homework_state(planned_row):
-    """
-    Возвращает 'none' | 'ok' | 'pending' | 'overdue'
-    """
     if not planned_row["homework_due_date"]:
         return "none"
     rows = get_homework_rows(planned_row["id"])
@@ -550,7 +538,110 @@ def homework_state(planned_row):
     return "pending"
 
 
-# ---------- Анализ GigaChat (без изменений) ----------
+# ---------- Редактор карточки занятия ----------
+def render_planned_card_editor(pl, *, key_prefix: str, compact: bool = False):
+    pl_id = pl["id"]
+    key_base = f"{key_prefix}_{pl_id}"
+    refresh_needed = False
+
+    topic_val = st.text_input(
+        "Тема",
+        value=pl["title"] or "",
+        key=f"{key_base}_title",
+        placeholder="Например: Lektion 05 — Reisen",
+        label_visibility="collapsed" if compact else "visible",
+    )
+    if topic_val != (pl["title"] or ""):
+        update_planned(pl_id, title=topic_val)
+        refresh_needed = True
+
+    col1, col2 = st.columns(2)
+    with col1:
+        prep = st.checkbox("Подготовлено",
+                           value=bool(pl["is_prepared"]),
+                           key=f"{key_base}_prep")
+        if prep != bool(pl["is_prepared"]):
+            update_planned(pl_id, is_prepared=1 if prep else 0)
+    with col2:
+        cond = st.checkbox("Проведено",
+                           value=bool(pl["is_conducted"]),
+                           key=f"{key_base}_cond")
+        if cond != bool(pl["is_conducted"]):
+            update_planned(pl_id, is_conducted=1 if cond else 0)
+            refresh_needed = True
+
+    if pl["is_conducted"] and not pl["lesson_id"]:
+        if st.button("📥 Загрузить", key=f"{key_base}_upload", use_container_width=True):
+            st.session_state["prefill_planned_id"] = pl_id
+            st.session_state["prefill_lesson"] = {
+                "title": pl["title"] or "",
+                "date": pl["scheduled_at"],
+                "group_name": pl["group_name"],
+            }
+            st.session_state["pending_nav"] = "Добавить урок"
+            st.rerun()
+
+    if pl["lesson_id"]:
+        st.caption(f"✅ Урок загружен (lesson #{pl['lesson_id']})")
+
+    due_val = pl["homework_due_date"] or ""
+    due_label = "Дедлайн домашки" if not compact else "Дедлайн ДЗ"
+    new_due_date = st.date_input(
+        due_label,
+        value=date.fromisoformat(due_val) if due_val else None,
+        key=f"{key_base}_due",
+        format="DD.MM.YYYY",
+    )
+    new_due_iso = new_due_date.isoformat() if new_due_date else ""
+    if new_due_iso != due_val:
+        update_planned(pl_id, homework_due_date=new_due_iso)
+        refresh_needed = True
+
+    qc = st.columns([1, 1, 1])
+    for i, days in enumerate([3, 5, 7]):
+        if qc[i].button(f"+{days}д", key=f"{key_base}_q{i}", use_container_width=True):
+            update_planned(
+                pl_id,
+                homework_due_date=(date.today() + timedelta(days=days)).isoformat(),
+            )
+            refresh_needed = True
+
+    ensure_homework_rows(pl_id, pl["group_id"])
+    hw_rows = get_homework_rows(pl_id)
+    if not hw_rows:
+        st.caption("В группе нет учеников.")
+    else:
+        done_cnt = sum(1 for h in hw_rows if h["is_done"])
+        with st.expander(f"Отметки ({done_cnt}/{len(hw_rows)})", expanded=not compact):
+            for hw in hw_rows:
+                cA, cB = st.columns([4, 1])
+                cA.write(hw["student_name"])
+                checked = bool(hw["is_done"])
+                new_checked = cB.checkbox(
+                    "Сдал", value=checked,
+                    key=f"{key_base}_hw_{hw['student_id']}",
+                    label_visibility="collapsed",
+                )
+                if new_checked != checked:
+                    set_homework_done(pl_id, hw["student_id"], new_checked)
+                    refresh_needed = True
+
+    state = homework_state(get_planned(pl_id))
+    if state == "overdue":
+        st.markdown('<span class="hw-badge bad">Домашка просрочена</span>',
+                    unsafe_allow_html=True)
+    elif state == "ok":
+        st.markdown('<span class="hw-badge ok">Все сдали</span>',
+                    unsafe_allow_html=True)
+    elif state == "pending":
+        st.markdown('<span class="hw-badge pending">Ожидается</span>',
+                    unsafe_allow_html=True)
+
+    if refresh_needed:
+        st.rerun()
+
+
+# ---------- Анализ GigaChat ----------
 def run_ai_analysis(lesson_id):
     logger.info("---- run_ai_analysis START lesson_id=%s ----", lesson_id)
 
@@ -646,18 +737,397 @@ def run_ai_analysis(lesson_id):
     return True, f"Анализ завершён. Наблюдений: {len(observations)}."
 
 
+# =====================================================================
+#                          AI-ПОМОЩНИК ПРЕПОДАВАТЕЛЯ
+# =====================================================================
+
+AI_SYSTEM_PROMPT = """Ты — ассистент преподавателя немецкого языка.
+Твоя задача — помогать анализировать уроки, учеников, домашние задания и прогресс.
+
+У тебя есть доступ к локальной базе данных SQLite (только ЧТЕНИЕ) через инструмент
+`run_sql`. Ты можешь писать SQL-запросы SELECT, чтобы получать нужные данные.
+
+Схема базы:
+
+- students(id, name, normalized_name, created_at)
+- lessons(id, title, lesson_date, topic, group_name, audio_path, transcript_filename, created_at)
+- segments(id, lesson_id, segment_index, start_seconds, end_seconds, speaker_name,
+           speaker_role, student_id, text)
+- observations(id, lesson_id, student_id, category, topic, description, evidence,
+               start_seconds, end_seconds, confidence, recommended_action, status, created_at)
+- groups(id, name, level, note, created_at)
+- group_students(group_id, student_id)
+- group_schedule(id, group_id, weekday, start_time, duration_min)
+- planned_lessons(id, group_id, scheduled_at, title, topic, is_prepared, is_conducted,
+                 lesson_id, homework_due_date, created_at)
+- homework_status(id, planned_lesson_id, student_id, is_done, done_at)
+
+Дополнительные сведения:
+- Преподавателя зовут {teacher}. с тобой общается только он, то есть ты знаешь с кем говоришь
+- Даты хранятся в ISO (YYYY-MM-DD, YYYY-MM-DDTHH:MM).
+- homework_due_date = '' означает, что домашка не задавалась.
+- Статусы наблюдений: 'Требует проверки', 'Подтверждено', 'Отклонено'.
+
+Правила:
+1. Для получения данных используй run_sql (только SELECT).
+2. Не выдумывай данные. Если SQL не дал ответа — скажи об этом.
+3. Отвечай на русском, кратко и по делу. Если полезно — приводи таблицу или список.
+4. Если вопрос неясен, задай уточняющий вопрос.
+5. Никогда не выполняй INSERT/UPDATE/DELETE/DROP/ALTER — это запрещено.
+6. Если нужно найти ученика по имени, а он может быть записан и кириллицей, и латиницей,
+   сначала вызови инструмент `find_student` — он вернёт кандидатов.
+   Не полагайся на точное `=` в SQL по имени, используй `LIKE '%...%'` или `find_student`.
+
+ВАЖНО про имена: в базе имена могут быть записаны и на кириллице, и в латинице
+(например, «Анна Лыкова» / «Anna Lykova»). Если точного совпадения нет — пробуй:
+- `WHERE name LIKE '%<часть имени>%' COLLATE NOCASE`
+- транслит: «Анна» -> «Anna», «Лыкова» -> «Lykova»
+- инструмент `find_student`, который сам делает нечёткое сопоставление.
+""".replace("{teacher}", TEACHER_NAME)
+
+
+AI_SQL_TOOL_SCHEMA = {
+    "name": "run_sql",
+    "description": (
+        "Выполнить SQL SELECT-запрос к локальной базе данных приложения "
+        "и вернуть результат в виде строк. Разрешены только SELECT-запросы."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "SQL SELECT-запрос (SQLite).",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Максимум строк в ответе (по умолчанию 200).",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
+_AI_FORBIDDEN_KEYWORDS = (
+    "insert", "update", "delete", "drop", "alter", "create", "replace",
+    "attach", "detach", "pragma", "vacuum", "truncate", "grant", "revoke",
+)
+
+
+# ---------- Транслитерация RU -> LAT для сопоставления имён ----------
+_TRANSLIT_MAP = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit_ru_to_lat(text: str) -> str:
+    """Простая транслитерация русских букв в латиницу."""
+    if not text:
+        return ""
+    out = []
+    for ch in text.lower():
+        out.append(_TRANSLIT_MAP.get(ch, ch))
+    return "".join(out)
+
+
+def name_variants(name: str) -> list[str]:
+    """
+    Возвращает список возможных написаний имени:
+    оригинал, транслит, lowercase-версии, отдельные части (имя, фамилия).
+    Используется для нечёткого поиска студентов.
+    """
+    if not name:
+        return []
+    variants: set[str] = set()
+    name = name.strip()
+    parts = re.split(r"\s+", name)
+
+    def add(s):
+        s = (s or "").strip()
+        if s:
+            variants.add(s)
+            variants.add(s.lower())
+
+    add(name)
+    add(translit_ru_to_lat(name))
+    for p in parts:
+        add(p)
+        add(translit_ru_to_lat(p))
+    return sorted(variants)
+
+
+def ai_find_student(query: str) -> dict:
+    """
+    Ищет студентов по нечёткому совпадению.
+    Возвращает {'candidates': [{'id', 'name'}, ...]}.
+    """
+    if not query or not query.strip():
+        return {"candidates": []}
+
+    q = query.strip()
+    variants = name_variants(q)
+    with db() as con:
+        found: dict[int, str] = {}
+        for v in variants:
+            pattern = f"%{v}%"
+            rows = con.execute(
+                "SELECT id, name FROM students "
+                "WHERE lower(name) LIKE lower(?) "
+                "   OR lower(translit_placeholder) LIKE lower(?) "
+                "LIMIT 20".replace("translit_placeholder", "name"),
+                (pattern, pattern),
+            ).fetchall()
+            for r in rows:
+                found[r["id"]] = r["name"]
+
+        # Второй проход: сравниваем по транслиту уже сохранённых имён
+        all_rows = con.execute("SELECT id, name FROM students").fetchall()
+        q_lat = translit_ru_to_lat(q).lower()
+        q_tokens = set(re.split(r"\s+", q_lat))
+        for r in all_rows:
+            r_lat = translit_ru_to_lat(r["name"]).lower()
+            r_tokens = set(re.split(r"\s+", r_lat))
+            if q_lat and (q_lat in r_lat or r_lat in q_lat):
+                found[r["id"]] = r["name"]
+            elif q_tokens & r_tokens and any(len(t) >= 3 for t in (q_tokens & r_tokens)):
+                found[r["id"]] = r["name"]
+
+    return {"candidates": [{"id": i, "name": n} for i, n in found.items()]}
+
+
+def ai_run_sql(query: str, limit: int = 200) -> dict:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "Пустой запрос."}
+
+    lowered = query.lower()
+    stripped = lowered.lstrip()
+    if not (stripped.startswith("select") or stripped.startswith("with")):
+        return {"error": "Разрешены только SELECT-запросы."}
+    for kw in _AI_FORBIDDEN_KEYWORDS:
+        if re.search(rf"\b{kw}\b", lowered):
+            return {"error": f"Запрещённое ключевое слово: {kw}."}
+
+    try:
+        limit = max(1, min(int(limit or 200), 500))
+    except Exception:
+        limit = 200
+
+    try:
+        with db() as con:
+            con.execute("PRAGMA query_only = ON")
+            cur = con.execute(query)
+            cols = [d[0] for d in (cur.description or [])]
+            rows = cur.fetchmany(limit)
+    except Exception as exc:
+        logger.exception("ai_run_sql failed: %s", query)
+        return {"error": f"Ошибка SQL: {exc}"}
+
+    rows_serializable = [list(r) for r in rows]
+    return {
+        "columns": cols,
+        "rows": rows_serializable,
+        "row_count": len(rows_serializable),
+    }
+
+
+def _ai_try_extract_tool_calls(message) -> list[dict]:
+    calls: list[dict] = []
+
+    fc = getattr(message, "function_call", None)
+    if fc is not None:
+        name = getattr(fc, "name", None) or (fc.get("name") if isinstance(fc, dict) else None)
+        args = getattr(fc, "arguments", None)
+        if args is None and isinstance(fc, dict):
+            args = fc.get("arguments")
+        if name:
+            calls.append({"name": name, "arguments": args, "raw": fc})
+
+    fcs = getattr(message, "function_calls", None)
+    if fcs:
+        for one in fcs:
+            name = getattr(one, "name", None) or (one.get("name") if isinstance(one, dict) else None)
+            args = getattr(one, "arguments", None)
+            if args is None and isinstance(one, dict):
+                args = one.get("arguments")
+            if name:
+                calls.append({"name": name, "arguments": args, "raw": one})
+
+    return calls
+
+
+def _ai_parse_args(args) -> dict:
+    if args is None:
+        return {}
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except Exception:
+            return {}
+    return {}
+
+
+def ai_chat_step(messages: list[dict], max_tool_rounds: int = 4) -> str:
+    credentials = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+    if not credentials:
+        raise RuntimeError("Не задан GIGACHAT_CREDENTIALS.")
+
+    from gigachat import GigaChat
+    from gigachat.models import Chat, Messages, MessagesRole, Function, FunctionParameters
+
+    giga = GigaChat(
+        credentials=credentials,
+        base_url="https://api.giga.chat/v1",
+        model="GigaChat-3-Ultra",
+        verify_ssl_certs=False,
+        max_tokens=8000,
+    )
+
+    def _to_sdk(msgs: list[dict]) -> list[Messages]:
+        out: list[Messages] = []
+        for m in msgs:
+            role = m.get("role")
+            content = m.get("content") or ""
+            if role == "system":
+                out.append(Messages(role=MessagesRole.SYSTEM, content=content))
+            elif role == "user":
+                out.append(Messages(role=MessagesRole.USER, content=content))
+            elif role == "assistant":
+                item: dict = {"role": "assistant", "content": content}
+                fc = m.get("function_call")
+                if fc:
+                    # GigaChat SDK (pydantic) ждёт function_call.arguments как dict,
+                    # но мы можем хранить его и как строку — нормализуем здесь.
+                    args = fc.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    item["function_call"] = {
+                        "name": fc.get("name", "run_sql"),
+                        "arguments": args if isinstance(args, dict) else {},
+                    }
+                out.append(Messages(**item))
+            elif role == "function":
+                out.append(Messages(
+                    role=MessagesRole.FUNCTION,
+                    content=content,
+                    name=m.get("name") or "run_sql",
+                ))
+        return out
+
+    functions = [
+        Function(
+            name=AI_SQL_TOOL_SCHEMA["name"],
+            description=AI_SQL_TOOL_SCHEMA["description"],
+            parameters=FunctionParameters(
+                type="object",
+                properties={
+                    "query": {"type": "string", "description": "SQL SELECT-запрос."},
+                    "limit": {"type": "integer", "description": "Максимум строк (<=500)."},
+                },
+                required=["query"],
+            ),
+        ),
+        Function(
+            name="find_student",
+            description=(
+                "Найти ученика по имени с учётом возможной транслитерации "
+                "(кириллица <-> латиница). Возвращает список кандидатов с id и name."
+            ),
+            parameters=FunctionParameters(
+                type="object",
+                properties={
+                    "query": {
+                        "type": "string",
+                        "description": "Имя (или его часть) на русском или латинице.",
+                    },
+                },
+                required=["query"],
+            ),
+        ),
+    ]
+
+    working = list(messages)
+    for _ in range(max_tool_rounds):
+        chat = Chat(
+            messages=_to_sdk(working),
+            functions=functions,
+            function_call="auto",
+        )
+        response = giga.chat(chat)
+        msg = response.choices[0].message
+
+        tool_calls = _ai_try_extract_tool_calls(msg)
+        if not tool_calls:
+            content = msg.content or ""
+            working.append({"role": "assistant", "content": content})
+            messages.clear()
+            messages.extend(working)
+            return content
+
+        first = tool_calls[0]
+        # Нормализуем arguments в dict — pydantic в SDK требует именно dict.
+        raw_args = first["arguments"]
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except Exception:
+                raw_args = {}
+        elif raw_args is None:
+            raw_args = {}
+        if not isinstance(raw_args, dict):
+            raw_args = {}
+
+        fc_dict = {
+            "name": first["name"],
+            "arguments": raw_args,
+        }
+        working.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "function_call": fc_dict,
+        })
+
+        for call in tool_calls:
+            name = call["name"]
+            args = _ai_parse_args(call["arguments"])
+            if name == "run_sql":
+                result = ai_run_sql(args.get("query", ""), args.get("limit", 200))
+            elif name == "find_student":
+                result = ai_find_student(args.get("query", ""))
+            else:
+                result = {"error": f"Неизвестный инструмент: {name}"}
+            working.append({
+                "role": "function",
+                "name": name,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            })
+
+    fallback = "Не удалось завершить ответ: превышено число шагов с инструментами."
+    working.append({"role": "assistant", "content": fallback})
+    messages.clear()
+    messages.extend(working)
+    return fallback
+
+
 # ---------- Инициализация ----------
 init_db()
 
 # ---------- Боковая навигация ----------
-# ---------- Боковая навигация ----------
-PAGES = ["Обзор", "Добавить урок", "Календарь", "Ежедневник",
+PAGES = ["Обзор", "AI-помощник", "Добавить урок", "Календарь", "Ежедневник",
          "Уроки и транскрипты", "Группы", "Ученики", "Аналитика"]
 
 if "nav" not in st.session_state:
     st.session_state["nav"] = "Обзор"
 
-# применяем отложенный переход ДО отрисовки radio
 if "pending_nav" in st.session_state:
     target = st.session_state.pop("pending_nav")
     if target in PAGES:
@@ -701,7 +1171,6 @@ if page == "Обзор":
     else:
         st.dataframe(lessons_df, use_container_width=True, hide_index=True)
 
-    # NEW: напоминания о ближайших занятиях
     st.markdown("### Ближайшие занятия")
     upcoming = get_upcoming_planned(days_ahead=7)
     if not upcoming:
@@ -722,6 +1191,90 @@ if page == "Обзор":
                 </div>""",
                 unsafe_allow_html=True
             )
+
+
+# =====================================================================
+#                            AI-ПОМОЩНИК
+# =====================================================================
+elif page == "AI-помощник":
+    st.markdown("## 🤖 AI-помощник преподавателя")
+    st.caption("Задавайте вопросы о занятиях, учениках, домашке и прогрессе. "
+               "Помощник умеет обращаться к базе данных через SQL.")
+
+    if "ai_messages" not in st.session_state:
+        st.session_state["ai_messages"] = [
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+        ]
+    if "ai_display" not in st.session_state:
+        st.session_state["ai_display"] = []
+
+    top1, top2 = st.columns([3, 1])
+    with top1:
+        st.caption("Примеры: «Сколько уроков провёл каждый ученик?», "
+                   "«Какие домашки просрочены?», "
+                   "«О чём был последний урок группы A2?»")
+    with top2:
+        if st.button("🗑 Очистить диалог", use_container_width=True):
+            st.session_state["ai_messages"] = [
+                {"role": "system", "content": AI_SYSTEM_PROMPT},
+            ]
+            st.session_state["ai_display"] = []
+            st.rerun()
+
+    st.divider()
+
+    chat_box = st.container()
+    with chat_box:
+        for m in st.session_state["ai_display"]:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+    user_input = st.chat_input("Ваш вопрос...")
+    if user_input:
+        st.session_state["ai_display"].append({"role": "user", "content": user_input})
+        with chat_box:
+            with st.chat_message("user"):
+                st.markdown(user_input)
+
+        st.session_state["ai_messages"].append({"role": "user", "content": user_input})
+
+        with st.spinner("Думаю..."):
+            try:
+                answer = ai_chat_step(st.session_state["ai_messages"])
+            except Exception as exc:
+                logger.exception("Ошибка AI-помощника")
+                answer = f"⚠️ Ошибка: {exc}"
+
+        st.session_state["ai_display"].append({"role": "assistant", "content": answer})
+        with chat_box:
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+
+    if not st.session_state["ai_display"]:
+        st.markdown("### Быстрые запросы")
+        q1, q2, q3 = st.columns(3)
+        presets = [
+            "Покажи 5 последних уроков",
+            "Какие домашки просрочены?",
+            "Сводка наблюдений по ученикам",
+        ]
+        for i, q in enumerate(presets):
+            col = [q1, q2, q3][i]
+            with col:
+                if st.button(q, use_container_width=True, key=f"ai_preset_{i}"):
+                    st.session_state["ai_display"].append(
+                        {"role": "user", "content": q})
+                    st.session_state["ai_messages"].append(
+                        {"role": "user", "content": q})
+                    with st.spinner("Думаю..."):
+                        try:
+                            answer = ai_chat_step(st.session_state["ai_messages"])
+                        except Exception as exc:
+                            logger.exception("Ошибка AI-помощника")
+                            answer = f"⚠️ Ошибка: {exc}"
+                    st.session_state["ai_display"].append(
+                        {"role": "assistant", "content": answer})
+                    st.rerun()
 
 
 # =====================================================================
@@ -801,7 +1354,6 @@ elif page == "Добавить урок":
                             """, (lesson_id, i, seg["start_seconds"], seg["end_seconds"],
                                   speaker, role, sid, seg["text"]))
 
-                        # NEW: привязка к planned_lessons, если пришли из календаря
                         if planned_id:
                             con.execute(
                                 "UPDATE planned_lessons SET lesson_id=?, is_conducted=1 WHERE id=?",
@@ -843,7 +1395,6 @@ elif page == "Календарь":
             days_ahead = st.number_input("Показать занятия в следующие N дней",
                                          min_value=1, max_value=120, value=14, step=1)
 
-        # материализуем карточки для показанного окна и +30 дней вперёд
         for g in groups:
             if group_filter is None or g["id"] == group_filter:
                 upsert_planned_lessons_for_window(g["id"], days_ahead=int(days_ahead) + 30)
@@ -868,37 +1419,7 @@ elif page == "Календарь":
                 </div>""", unsafe_allow_html=True
             )
 
-            key_base = f"pl_{pl['id']}"
-
-            # --- 1. Тема определена ---
-            topic_val = st.text_input(
-                "Тема (название занятия)",
-                value=pl["title"] or "",
-                key=f"{key_base}_title",
-                placeholder="Например: Lektion 05 — Reisen"
-            )
-            if topic_val != (pl["title"] or ""):
-                update_planned(pl["id"], title=topic_val)
-                st.rerun()
-
             topic_done = bool((pl["title"] or "").strip())
-
-            # --- 2. Занятие подготовлено ---
-            prep = st.checkbox("Занятие подготовлено",
-                               value=bool(pl["is_prepared"]),
-                               key=f"{key_base}_prep")
-            if prep != bool(pl["is_prepared"]):
-                update_planned(pl["id"], is_prepared=1 if prep else 0)
-
-            # --- 3. Занятие проведено ---
-            cond = st.checkbox("Занятие проведено",
-                               value=bool(pl["is_conducted"]),
-                               key=f"{key_base}_cond")
-            if cond != bool(pl["is_conducted"]):
-                update_planned(pl["id"], is_conducted=1 if cond else 0)
-                st.rerun()
-
-            # чек-лист прогресса одним взглядом
             checks = [
                 f"{'✅' if topic_done else '⬜'} тема",
                 f"{'✅' if pl['is_prepared'] else '⬜'} подготовлено",
@@ -907,80 +1428,10 @@ elif page == "Календарь":
             ]
             st.caption(" · ".join(checks))
 
-            # --- 3a. Кнопка «Загрузить занятие» ---
-            if pl["is_conducted"] and not pl["lesson_id"]:
-                if st.button("📥 Загрузить это занятие", key=f"{key_base}_upload"):
-                    st.session_state["prefill_planned_id"] = pl["id"]
-                    st.session_state["prefill_lesson"] = {
-                        "title": pl["title"] or "",
-                        "date": pl["scheduled_at"],
-                        "group_name": pl["group_name"],
-                    }
-                    st.session_state["pending_nav"] = "Добавить урок"
-                    st.rerun()
-            if pl["lesson_id"]:
-                st.success(f"Занятие в базе (lesson #{pl['lesson_id']}).")
-
-            # --- 4. Домашка ---
-            ensure_homework_rows(pl["id"], pl["group_id"])
-            st.markdown("**📝 Домашнее задание**")
-
-            due_val = pl["homework_due_date"] or ""
-            new_due_date = st.date_input(
-                "Дедлайн домашки",
-                value=date.fromisoformat(due_val) if due_val else None,
-                key=f"{key_base}_due",
-                format="DD.MM.YYYY",
-            )
-            new_due_iso = new_due_date.isoformat() if new_due_date else ""
-            if new_due_iso != due_val:
-                update_planned(pl["id"], homework_due_date=new_due_iso)
-                st.rerun()
-
-            # быстрые кнопки «через N дней»
-            qc = st.columns([1, 1, 1, 4])
-            for i, days in enumerate([3, 5, 7]):
-                if qc[i].button(f"+{days} дн.", key=f"{key_base}_q{i}"):
-                    update_planned(
-                        pl["id"],
-                        homework_due_date=(date.today() + timedelta(days=days)).isoformat(),
-                    )
-                    st.rerun()
-
-            # отметки по ученикам — всегда видны
-            hw_rows = get_homework_rows(pl["id"])
-            if not hw_rows:
-                st.caption("В группе ещё нет учеников — отметьте состав во вкладке «Группы».")
-            else:
-                done_cnt = sum(1 for h in hw_rows if h["is_done"])
-                with st.expander(f"Отметки по ученикам ({done_cnt}/{len(hw_rows)})",
-                                 expanded=True):
-                    for hw in hw_rows:
-                        col_a, col_b = st.columns([4, 1])
-                        col_a.write(hw["student_name"])
-                        checked = bool(hw["is_done"])
-                        new_checked = col_b.checkbox(
-                            "Сдал", value=checked,
-                            key=f"{key_base}_hw_{hw['student_id']}",
-                            label_visibility="collapsed",
-                        )
-                        if new_checked != checked:
-                            set_homework_done(pl["id"], hw["student_id"], new_checked)
-                            st.rerun()
-
-            # итоговый бейдж
-            state = homework_state(get_planned(pl["id"]))
-            if state == "overdue":
-                st.markdown('<span class="hw-badge bad">Домашка просрочена</span>',
-                            unsafe_allow_html=True)
-            elif state == "ok":
-                st.markdown('<span class="hw-badge ok">Все сдали</span>',
-                            unsafe_allow_html=True)
-            elif state == "pending":
-                st.markdown('<span class="hw-badge pending">Ожидается</span>',
-                            unsafe_allow_html=True)
+            render_planned_card_editor(pl, key_prefix="cal")
 
             st.divider()
+
 
 # =====================================================================
 #                              ЕЖЕДНЕВНИК
@@ -993,26 +1444,18 @@ elif page == "Ежедневник":
     if not groups:
         st.info("Сначала создайте группы и расписание во вкладке «Группы».")
     else:
-        # ---- Панель управления: группа, режим, дата ----
-        # ---- Служебное состояние (не привязано к виджетам!) ----
         if "diary_ref" not in st.session_state:
             st.session_state["diary_ref"] = date.today()
         if "diary_date_widget" not in st.session_state:
             st.session_state["diary_date_widget"] = st.session_state["diary_ref"]
 
-
         def _diary_sync_from_widget():
-            """Пользователь выбрал дату в date_input — обновляем эталон."""
             st.session_state["diary_ref"] = st.session_state["diary_date_widget"]
 
-
         def _diary_set(d):
-            """Программно меняем эталон и виджет ДО их отрисовки."""
             st.session_state["diary_ref"] = d
             st.session_state["diary_date_widget"] = d
 
-
-        # ---- Панель управления: группа, режим, дата ----
         top1, top2, top3 = st.columns([2, 2, 2])
         with top1:
             group_options = {"Все группы": None} | {g["name"]: g["id"] for g in groups}
@@ -1023,7 +1466,6 @@ elif page == "Ежедневник":
             view_mode = st.radio("Вид", ["Неделя", "День"],
                                  horizontal=True, key="diary_view")
         with top3:
-            # date_input пишет в отдельный ключ, синхронизация — через on_change
             st.date_input(
                 "Дата",
                 value=st.session_state["diary_date_widget"],
@@ -1033,7 +1475,6 @@ elif page == "Ежедневник":
 
         ref_date = st.session_state["diary_ref"]
 
-        # ---- Навигация стрелками ----
         nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
         delta = timedelta(days=7 if view_mode == "Неделя" else 1)
         if nav1.button("← Предыдущая", key="diary_prev", use_container_width=True):
@@ -1058,7 +1499,6 @@ elif page == "Ежедневник":
 
         st.divider()
 
-        # ---- Считаем диапазон ----
         if view_mode == "Неделя":
             monday = ref_date - timedelta(days=ref_date.weekday())
             sunday = monday + timedelta(days=6)
@@ -1066,14 +1506,12 @@ elif page == "Ежедневник":
         else:
             range_start = range_end = ref_date
 
-        # материализуем карточки, чтобы окно точно было заполнено
         for g in groups:
             if group_filter is None or g["id"] == group_filter:
                 upsert_planned_lessons_for_window(g["id"], days_ahead=180)
 
         planned = get_planned_in_range(range_start, range_end, group_id=group_filter)
 
-        # группируем по дате
         by_day = {}
         for pl in planned:
             d = datetime.fromisoformat(pl["scheduled_at"]).date()
@@ -1103,7 +1541,11 @@ elif page == "Ежедневник":
                 f'</div>'
             )
 
-        # ---- Отрисовка ----
+        def open_in_calendar(target_date: date):
+            st.session_state["diary_ref_date"] = target_date
+            st.session_state["pending_nav"] = "Календарь"
+            st.rerun()
+
         if view_mode == "Неделя":
             days = [range_start + timedelta(days=i) for i in range(7)]
             cols = st.columns(7)
@@ -1126,9 +1568,20 @@ elif page == "Ежедневник":
                     else:
                         for pl in items:
                             st.markdown(_event_html(pl), unsafe_allow_html=True)
+                            with st.expander("✏️ Редактировать", expanded=False):
+                                render_planned_card_editor(
+                                    pl,
+                                    key_prefix=f"diary_w_{d.isoformat()}",
+                                    compact=True,
+                                )
+                                if st.button(
+                                        "Открыть в календаре",
+                                        key=f"diary_w_open_{pl['id']}",
+                                        use_container_width=True,
+                                ):
+                                    open_in_calendar(d)
                     st.markdown('</div>', unsafe_allow_html=True)
         else:
-            # День — карточки детальнее
             items = by_day.get(ref_date, [])
             if not items:
                 st.info("На этот день занятий нет.")
@@ -1140,40 +1593,32 @@ elif page == "Ежедневник":
                     border_color = "#4caf50"
                 if hw == "overdue":
                     border_color = "#d9534f"
-                hw_label = {
-                    "ok": '<span class="hw-badge ok">Домашка сдана</span>',
-                    "overdue": '<span class="hw-badge bad">Домашка просрочена</span>',
-                    "pending": '<span class="hw-badge pending">Ожидается</span>',
-                    "none": "",
-                }[hw]
+
                 st.markdown(
                     f"""<div class="cal-card" style="border-left-color:{border_color}">
                     <h4>{pl['title'] or '— без темы —'}</h4>
                     <div class="cal-meta">{pl['group_name']} · {dt.strftime('%H:%M')}
                     · {'проведено' if pl['is_conducted'] else 'запланировано'}
-                    · {'подготовлено' if pl['is_prepared'] else 'не подготовлено'}
-                    {hw_label}</div>
+                    · {'подготовлено' if pl['is_prepared'] else 'не подготовлено'}</div>
                     </div>""",
                     unsafe_allow_html=True
                 )
+                render_planned_card_editor(
+                    pl,
+                    key_prefix=f"diary_d_{ref_date.isoformat()}",
+                    compact=False,
+                )
+                if st.button(
+                        "Открыть в календаре",
+                        key=f"diary_d_open_{pl['id']}",
+                        use_container_width=True,
+                ):
+                    open_in_calendar(ref_date)
+                st.divider()
 
-            # сводка по домашка
-            if items:
-                st.markdown("### Домашка на этот день")
-                for pl in items:
-                    if not pl["homework_due_date"]:
-                        continue
-                    hw_rows = get_homework_rows(pl["id"])
-                    if not hw_rows:
-                        continue
-                    st.markdown(f"**{pl['title'] or '— без темы —'}** · "
-                                f"дедлайн {pl['homework_due_date']}")
-                    for hw in hw_rows:
-                        mark = "✅" if hw["is_done"] else "⬜"
-                        st.markdown(f"- {mark} {hw['student_name']}")
+        st.caption("Все изменения сохраняются сразу. Полный обзор недели/дня — здесь; "
+                   "детальные действия по уроку — во вкладке «Календарь».")
 
-        st.divider()
-        st.caption("Полный чек-лист занятия (тема, подготовка, домашка) — во вкладке «Календарь».")
 
 # =====================================================================
 #                          УРОКИ И ТРАНСКРИПТЫ
@@ -1295,7 +1740,6 @@ elif page == "Группы":
             with db() as con:
                 g = con.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
 
-            # --- Основные настройки ---
             col1, col2 = st.columns(2)
             with col1:
                 new_name = st.text_input("Название", value=g["name"], key=f"gname_{gid}")
@@ -1317,7 +1761,6 @@ elif page == "Группы":
 
             st.divider()
 
-            # --- Состав группы ---
             st.markdown("### Состав группы")
             all_students = get_all_students()
             current_members = {m["id"] for m in get_group_members(gid)}
@@ -1338,12 +1781,10 @@ elif page == "Группы":
 
             st.divider()
 
-            # --- Расписание ---
             st.markdown("### Расписание")
             sched = get_group_schedule(gid)
             st.caption("Дни недели и время начала. Продолжительность — минуты.")
 
-            # существующие строки
             updated_rows = []
             for i, s in enumerate(sched):
                 cols = st.columns([2, 2, 2, 1])
@@ -1361,7 +1802,6 @@ elif page == "Группы":
                     st.rerun()
                 updated_rows.append((WEEKDAYS_RU.index(wd), t.strftime("%H:%M"), int(dur)))
 
-            # добавление новой строки
             with st.expander("➕ Добавить день"):
                 cols = st.columns([2, 2, 2, 1])
                 new_wd = cols[0].selectbox("День", WEEKDAYS_RU, key=f"new_wd_{gid}")
@@ -1381,7 +1821,6 @@ elif page == "Группы":
                 st.success("Расписание сохранено.")
                 st.rerun()
 
-            # --- Сгенерировать карточки на 60 дней ---
             if st.button("🔁 Сгенерировать карточки занятий на 60 дней", key=f"gen_{gid}"):
                 upsert_planned_lessons_for_window(gid, days_ahead=60)
                 st.success("Карточки созданы. Смотрите вкладку «Календарь».")
@@ -1417,7 +1856,6 @@ elif page == "Ученики":
         c2.metric("Реплик", int(row["utterances_count"]))
         c3.metric("Наблюдений", int(row["observations_count"]))
 
-        # NEW: статистика по домашке
         with db() as con:
             hw = con.execute("""
                 SELECT
@@ -1503,7 +1941,6 @@ elif page == "Аналитика":
             GROUP BY l.id ORDER BY l.lesson_date
         """, con)
 
-        # NEW: сводка по домашке
         hw_summary = pd.read_sql_query("""
             SELECT s.name AS student,
                    SUM(CASE WHEN hs.is_done=1 THEN 1 ELSE 0 END) AS done_cnt,
