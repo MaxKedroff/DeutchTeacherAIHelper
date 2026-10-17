@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import json
@@ -8,9 +9,11 @@ import traceback
 import sys
 from pathlib import Path
 from datetime import datetime, date, time as dtime, timedelta
+import zipfile
 
 import streamlit as st
 import pandas as pd
+import streamlit.components.v1 as components
 
 
 # ---------- Санитайзер JSON для ответов LLM ----------
@@ -23,12 +26,16 @@ def _sanitize_json(text: str) -> str:
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audio"
+BOOKS_DIR = DATA_DIR / "books"
+BOOK_AUDIO_DIR = DATA_DIR / "audio_books"
 DB_PATH = DATA_DIR / "lessons.sqlite3"
 TEACHER_NAME = "Эвелина Акбашева"
 MODEL_NAME = os.getenv("GIGACHAT_MODEL", "GigaChat")
 
 DATA_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
+BOOKS_DIR.mkdir(exist_ok=True)
+BOOK_AUDIO_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(
     page_title="Deutsch Lernanalyse",
@@ -78,7 +85,6 @@ st.markdown("""
         background: rgba(120,130,140,.07); padding: 1rem; border-radius: 14px;
         border: 1px solid rgba(120,130,140,.13);
     }
-    /* Карточки календаря */
     .cal-card {
         border: 1px solid rgba(120,120,120,.25);
         border-left: 5px solid #4871b8;
@@ -98,8 +104,8 @@ st.markdown("""
     .hw-badge.ok {background: rgba(76,175,80,.18); color: #2e7d32;}
     .hw-badge.bad {background: rgba(217,83,79,.18); color: #b71c1c;}
     .hw-badge.pending {background: rgba(255,193,7,.20); color: #8d6e00;}
+    .hw-badge.book {background: rgba(120,90,180,.18); color: #4a2c8a;}
 
-    /* Ежедневник */
     .week-grid {
         display: grid;
         grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -142,6 +148,64 @@ st.markdown("""
     .day-empty {
         opacity: .5; font-size: .8rem; text-align: center; padding: 1rem 0;
     }
+
+    /* Библиотека */
+    .book-card {
+        border: 1px solid rgba(120,120,120,.22);
+        border-radius: 14px;
+        overflow: hidden;
+        background: rgba(120,130,140,.04);
+        margin-bottom: 1rem;
+        transition: transform .12s ease;
+    }
+    .book-card:hover {transform: translateY(-2px);}
+    .book-cover {
+        width: 100%;
+        aspect-ratio: 3 / 4;
+        background: linear-gradient(135deg, #5e7ec4, #7a9fd8);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 600;
+        font-size: 1.1rem;
+        text-align: center;
+        padding: 1rem;
+        box-sizing: border-box;
+        object-fit: cover;
+    }
+    .book-title {
+        padding: .55rem .7rem .25rem .7rem;
+        font-weight: 600;
+        font-size: .95rem;
+        line-height: 1.25;
+    }
+    .book-meta {
+        padding: 0 .7rem .7rem .7rem;
+        opacity: .7;
+        font-size: .8rem;
+    }
+    .reader-frame {
+        border: 1px solid rgba(120,120,120,.2);
+        border-radius: 12px;
+        overflow: hidden;
+        background: #fafafa;
+    }
+        .audio-item {
+        padding: .35rem .5rem;
+        border-radius: 8px;
+        margin-bottom: .25rem;
+        border: 1px solid transparent;
+        background: rgba(120,130,140,.03);
+        min-height: 44px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+    }
+    .audio-item:hover {background: rgba(72,113,184,.08);}
+    .audio-item.active {background: rgba(72,113,184,.14); border-color: #4871b8;}
+    .audio-track {font-weight: 600; font-size: .88rem; line-height: 1.2;}
+    .audio-sub {opacity: .65; font-size: .76rem; line-height: 1.2;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -240,6 +304,31 @@ def init_db():
             is_done INTEGER DEFAULT 0,
             done_at TEXT DEFAULT '',
             UNIQUE (planned_lesson_id, student_id)
+        );
+
+        -- NEW: библиотека
+        CREATE TABLE IF NOT EXISTS library_books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            author TEXT DEFAULT '',
+            level TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            cover_path TEXT DEFAULT '',
+            pdf_path TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS library_audio (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER NOT NULL REFERENCES library_books(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL,
+            audio_path TEXT NOT NULL,
+            duration_note TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS group_books (
+            group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
+            book_id INTEGER NOT NULL REFERENCES library_books(id) ON DELETE CASCADE,
+            assigned_at TEXT NOT NULL
         );
         """)
         ensure_student(con, TEACHER_NAME)
@@ -538,11 +627,218 @@ def homework_state(planned_row):
     return "pending"
 
 
+# ---------- Библиотека: доступ к данным ----------
+def list_books():
+    with db() as con:
+        return con.execute("SELECT * FROM library_books ORDER BY title COLLATE NOCASE").fetchall()
+
+
+def get_book(book_id):
+    with db() as con:
+        return con.execute("SELECT * FROM library_books WHERE id=?", (book_id,)).fetchone()
+
+
+def create_book(title, author, level, note, cover_bytes, cover_name, pdf_bytes, pdf_name):
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO library_books(title, author, level, note, cover_path, pdf_path, created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (title.strip(), author.strip(), level.strip(), note.strip(),
+             "", "", datetime.now().isoformat(timespec="seconds"))
+        )
+        book_id = cur.lastrowid
+
+    cover_rel = ""
+    if cover_bytes:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", cover_name or "cover")
+        cover_file = BOOKS_DIR / f"book_{book_id}_cover_{safe}"
+        cover_file.write_bytes(cover_bytes)
+        cover_rel = str(cover_file.relative_to(APP_DIR))
+
+    pdf_rel = ""
+    if pdf_bytes:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", pdf_name or "book.pdf")
+        pdf_file = BOOKS_DIR / f"book_{book_id}_{safe}"
+        pdf_file.write_bytes(pdf_bytes)
+        pdf_rel = str(pdf_file.relative_to(APP_DIR))
+
+    with db() as con:
+        con.execute("UPDATE library_books SET cover_path=?, pdf_path=? WHERE id=?",
+                    (cover_rel, pdf_rel, book_id))
+    return book_id
+
+
+def delete_book(book_id):
+    with db() as con:
+        audios = con.execute(
+            "SELECT audio_path FROM library_audio WHERE book_id=?", (book_id,)
+        ).fetchall()
+        book = con.execute("SELECT cover_path, pdf_path FROM library_books WHERE id=?",
+                           (book_id,)).fetchone()
+        con.execute("DELETE FROM library_books WHERE id=?", (book_id,))
+
+    for a in audios:
+        try:
+            (APP_DIR / a["audio_path"]).unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Не удалось удалить аудио %s", a["audio_path"])
+    if book:
+        for key in ("cover_path", "pdf_path"):
+            p = book[key]
+            if p:
+                try:
+                    (APP_DIR / p).unlink(missing_ok=True)
+                except Exception:
+                    logger.exception("Не удалось удалить файл %s", p)
+
+
+def add_book_audio(book_id, title, audio_bytes, audio_name, duration_note=""):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", audio_name or "audio.mp3")
+    target = BOOK_AUDIO_DIR / f"book_{book_id}_{uuid.uuid4().hex[:8]}_{safe}"
+    target.write_bytes(audio_bytes)
+    rel = str(target.relative_to(APP_DIR))
+    with db() as con:
+        pos = con.execute(
+            "SELECT COALESCE(MAX(position),0)+1 AS p FROM library_audio WHERE book_id=?",
+            (book_id,)
+        ).fetchone()["p"]
+        con.execute(
+            "INSERT INTO library_audio(book_id, position, title, audio_path, duration_note) "
+            "VALUES(?,?,?,?,?)",
+            (book_id, pos, title.strip() or audio_name, rel, duration_note.strip())
+        )
+
+
+_AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".ogg", ".aac", ".flac", ".opus")
+
+
+def add_book_audio_bulk(book_id, files) -> dict:
+    """
+    Пакетная загрузка аудио.
+    files — список dict {name, bytes}. Имя используется как title трека
+    (без расширения, подчёркивания -> пробелы).
+    Возвращает {'added': N, 'skipped': [имена], 'errors': [...]}
+    """
+    added = 0
+    skipped: list[str] = []
+    errors: list[str] = []
+
+    def _make_title(filename: str) -> str:
+        base = Path(filename).stem
+        # "01_lek_1" -> "01 lek 1"; оставляем как есть, только убираем подчёркивания
+        return re.sub(r"_+", " ", base).strip()
+
+    for f in files:
+        name = f.get("name") or "audio.mp3"
+        data = f.get("bytes") or b""
+        if not name.lower().endswith(_AUDIO_EXTS):
+            skipped.append(name)
+            continue
+        if not data:
+            skipped.append(name)
+            continue
+        try:
+            add_book_audio(
+                book_id,
+                _make_title(name),
+                data,
+                name,
+                duration_note="",
+            )
+            added += 1
+        except Exception as exc:
+            logger.exception("Не удалось добавить аудио %s", name)
+            errors.append(f"{name}: {exc}")
+
+    return {"added": added, "skipped": skipped, "errors": errors}
+
+
+def extract_audio_files_from_zip(zip_bytes: bytes) -> list[dict]:
+    """
+    Возвращает список dict {name, bytes} из ZIP-архива — только аудиофайлы.
+    Игнорирует вложенные папки (берёт basename).
+    """
+    result: list[dict] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            base = Path(info.filename).name
+            if not base or base.startswith("."):
+                continue
+            if not base.lower().endswith(_AUDIO_EXTS):
+                continue
+            try:
+                with zf.open(info) as fh:
+                    result.append({"name": base, "bytes": fh.read()})
+            except Exception:
+                logger.exception("Не удалось прочитать %s из архива", info.filename)
+    return result
+
+def delete_book_audio(audio_id):
+    with db() as con:
+        row = con.execute("SELECT audio_path FROM library_audio WHERE id=?", (audio_id,)).fetchone()
+        con.execute("DELETE FROM library_audio WHERE id=?", (audio_id,))
+    if row:
+        try:
+            (APP_DIR / row["audio_path"]).unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Не удалось удалить аудио %s", row["audio_path"])
+
+
+def get_book_audio(book_id):
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM library_audio WHERE book_id=? ORDER BY position, id",
+            (book_id,)
+        ).fetchall()
+
+
+def set_group_book(group_id, book_id):
+    with db() as con:
+        if book_id:
+            con.execute(
+                "INSERT INTO group_books(group_id, book_id, assigned_at) VALUES(?,?,?) "
+                "ON CONFLICT(group_id) DO UPDATE SET book_id=excluded.book_id, "
+                "assigned_at=excluded.assigned_at",
+                (group_id, book_id, datetime.now().isoformat(timespec="seconds"))
+            )
+        else:
+            con.execute("DELETE FROM group_books WHERE group_id=?", (group_id,))
+
+
+def get_group_book(group_id):
+    with db() as con:
+        return con.execute("""
+            SELECT b.* FROM group_books gb
+            JOIN library_books b ON b.id = gb.book_id
+            WHERE gb.group_id = ?
+        """, (group_id,)).fetchone()
+
+
+def get_group_book_by_name(group_name):
+    if not group_name:
+        return None
+    with db() as con:
+        row = con.execute("SELECT id FROM groups WHERE name=?", (group_name,)).fetchone()
+        if not row:
+            return None
+        return get_group_book(row["id"])
+
+
 # ---------- Редактор карточки занятия ----------
 def render_planned_card_editor(pl, *, key_prefix: str, compact: bool = False):
     pl_id = pl["id"]
     key_base = f"{key_prefix}_{pl_id}"
     refresh_needed = False
+
+    # Учебник группы (бейдж)
+    gbook = get_group_book_by_name(pl["group_name"]) if pl["group_name"] else None
+    if gbook:
+        st.markdown(
+            f'<span class="hw-badge book">📖 {gbook["title"]}</span>',
+            unsafe_allow_html=True
+        )
 
     topic_val = st.text_input(
         "Тема",
@@ -761,6 +1057,9 @@ AI_SYSTEM_PROMPT = """Ты — ассистент преподавателя н�
 - planned_lessons(id, group_id, scheduled_at, title, topic, is_prepared, is_conducted,
                  lesson_id, homework_due_date, created_at)
 - homework_status(id, planned_lesson_id, student_id, is_done, done_at)
+- library_books(id, title, author, level, note, cover_path, pdf_path, created_at)
+- library_audio(id, book_id, position, title, audio_path, duration_note)
+- group_books(group_id, book_id, assigned_at)
 
 Дополнительные сведения:
 - Преподавателя зовут {teacher}. с тобой общается только он, то есть ты знаешь с кем говоришь
@@ -852,7 +1151,6 @@ _TRANSLIT_MAP = {
 
 
 def translit_ru_to_lat(text: str) -> str:
-    """Простая транслитерация русских букв в латиницу."""
     if not text:
         return ""
     out = []
@@ -862,11 +1160,6 @@ def translit_ru_to_lat(text: str) -> str:
 
 
 def name_variants(name: str) -> list[str]:
-    """
-    Возвращает список возможных написаний имени:
-    оригинал, транслит, lowercase-версии, отдельные части (имя, фамилия).
-    Используется для нечёткого поиска студентов.
-    """
     if not name:
         return []
     variants: set[str] = set()
@@ -888,10 +1181,6 @@ def name_variants(name: str) -> list[str]:
 
 
 def ai_find_student(query: str) -> dict:
-    """
-    Ищет студентов по нечёткому совпадению.
-    Возвращает {'candidates': [{'id', 'name'}, ...]}.
-    """
     if not query or not query.strip():
         return {"candidates": []}
 
@@ -902,16 +1191,12 @@ def ai_find_student(query: str) -> dict:
         for v in variants:
             pattern = f"%{v}%"
             rows = con.execute(
-                "SELECT id, name FROM students "
-                "WHERE lower(name) LIKE lower(?) "
-                "   OR lower(translit_placeholder) LIKE lower(?) "
-                "LIMIT 20".replace("translit_placeholder", "name"),
-                (pattern, pattern),
+                "SELECT id, name FROM students WHERE lower(name) LIKE lower(?) LIMIT 20",
+                (pattern,),
             ).fetchall()
             for r in rows:
                 found[r["id"]] = r["name"]
 
-        # Второй проход: сравниваем по транслиту уже сохранённых имён
         all_rows = con.execute("SELECT id, name FROM students").fetchall()
         q_lat = translit_ru_to_lat(q).lower()
         q_tokens = set(re.split(r"\s+", q_lat))
@@ -933,17 +1218,6 @@ def ai_delete_planned_lesson(
     title: str | None = None,
     allow_with_lesson: bool = False,
 ) -> dict:
-    """
-    Удаляет карточку занятия из planned_lessons.
-
-    Можно указать либо planned_lesson_id (точно), либо набор фильтров
-    (group_name, lesson_date, title) — в этом случае удалится ровно одна
-    подходящая карточка. Если под фильтр попадает больше одной или ни одной —
-    возвращаем ошибку и список кандидатов, чтобы модель уточнила запрос.
-
-    allow_with_lesson=False по умолчанию — защита от случайного удаления
-    карточки, к которой уже привязан импортированный урок (lesson_id IS NOT NULL).
-    """
     def _row_to_dict(r):
         return {
             "id": r["id"],
@@ -955,7 +1229,6 @@ def ai_delete_planned_lesson(
         }
 
     with db() as con:
-        # --- Сценарий 1: точный id ---
         if planned_lesson_id:
             row = con.execute("""
                 SELECT pl.*, g.name AS group_name
@@ -977,7 +1250,6 @@ def ai_delete_planned_lesson(
             con.execute("DELETE FROM planned_lessons WHERE id=?", (row["id"],))
             return {"deleted": _row_to_dict(row)}
 
-        # --- Сценарий 2: поиск по фильтрам ---
         if not any([group_name, lesson_date, title]):
             return {
                 "error": (
@@ -1029,6 +1301,7 @@ def ai_delete_planned_lesson(
             }
         con.execute("DELETE FROM planned_lessons WHERE id=?", (row["id"],))
         return {"deleted": _row_to_dict(row)}
+
 
 def ai_run_sql(query: str, limit: int = 200) -> dict:
     if not isinstance(query, str) or not query.strip():
@@ -1132,8 +1405,6 @@ def ai_chat_step(messages: list[dict], max_tool_rounds: int = 4) -> str:
                 item: dict = {"role": "assistant", "content": content}
                 fc = m.get("function_call")
                 if fc:
-                    # GigaChat SDK (pydantic) ждёт function_call.arguments как dict,
-                    # но мы можем хранить его и как строку — нормализуем здесь.
                     args = fc.get("arguments")
                     if isinstance(args, str):
                         try:
@@ -1243,7 +1514,6 @@ def ai_chat_step(messages: list[dict], max_tool_rounds: int = 4) -> str:
             return content
 
         first = tool_calls[0]
-        # Нормализуем arguments в dict — pydantic в SDK требует именно dict.
         raw_args = first["arguments"]
         if isinstance(raw_args, str):
             try:
@@ -1300,7 +1570,7 @@ init_db()
 
 # ---------- Боковая навигация ----------
 PAGES = ["Обзор", "AI-помощник", "Добавить урок", "Календарь", "Ежедневник",
-         "Уроки и транскрипты", "Группы", "Ученики", "Аналитика"]
+         "Библиотека", "Уроки и транскрипты", "Группы", "Ученики", "Аналитика"]
 
 if "nav" not in st.session_state:
     st.session_state["nav"] = "Обзор"
@@ -1798,6 +2068,323 @@ elif page == "Ежедневник":
 
 
 # =====================================================================
+#                              БИБЛИОТЕКА
+# =====================================================================
+elif page == "Библиотека":
+    st.markdown("## 📚 Библиотека")
+    st.caption("Учебники, аудио и прикрепление книг к группам.")
+
+    if "book_reader_id" not in st.session_state:
+        st.session_state["book_reader_id"] = None
+    if "book_audio_sel" not in st.session_state:
+        st.session_state["book_audio_sel"] = None
+
+    # ---- Если открыт ридер ----
+    if st.session_state["book_reader_id"]:
+        book_id = st.session_state["book_reader_id"]
+        book = get_book(book_id)
+        if not book:
+            st.session_state["book_reader_id"] = None
+            st.rerun()
+
+        top1, top2 = st.columns([3, 1])
+        with top1:
+            st.markdown(f"### {book['title']}")
+            st.caption(f"{book['author'] or '—'} · {book['level'] or '—'}")
+        with top2:
+            if st.button("← Назад к полке", use_container_width=True):
+                st.session_state["book_reader_id"] = None
+                st.rerun()
+
+        st.divider()
+
+        left, right = st.columns([3, 2], gap="large")
+        with left:
+            st.markdown("**Чтение**")
+
+            pdf_path_val = book["pdf_path"] or ""
+            if pdf_path_val:
+                pdf_file = APP_DIR / pdf_path_val
+                if pdf_file.exists():
+                    pdf_bytes = pdf_file.read_bytes()
+
+                    # Пытаемся показать встроенным плеером Streamlit (>= 1.35)
+                    pdf_rendered = False
+                    if hasattr(st, "pdf"):
+                        try:
+                            st.pdf(pdf_bytes, height=800)
+                            pdf_rendered = True
+                        except Exception as e:
+                            logger.exception("Ошибка st.pdf: %s", e)
+
+                    # Фолбэк: HTML iframe с base64 (может не сработать в некоторых браузерах)
+                    if not pdf_rendered:
+                        import base64
+
+                        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+                        html = f'''
+                            <div class="reader-frame">
+                              <iframe src="data:application/pdf;base64,{b64}#toolbar=1"
+                                      width="100%" height="800px"
+                                      style="border:0"></iframe>
+                            </div>
+                        '''
+                        components.html(html, height=820, scrolling=True)
+
+                    st.download_button(
+                        "⬇️ Скачать PDF",
+                        data=pdf_bytes,
+                        file_name=Path(pdf_path_val).name,
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning(
+                        f"Файл PDF не найден на диске: `{pdf_path_val}`. "
+                        "Возможно, он был удалён вручную."
+                    )
+            else:
+                st.info("У этого учебника нет загруженного PDF.")
+
+        with right:
+            st.markdown("**🎧 Аудио**")
+            audios = get_book_audio(book_id)
+
+            if not audios:
+                st.caption("К учебнику пока не добавлено аудио.")
+            else:
+                # Высота списка подобрана так, чтобы вместе с плеером (≈80px)
+                # и заголовком она совпадала с левым блоком чтения (≈800px).
+                list_height = 700
+                audio_list_container = st.container(height=list_height, border=False)
+
+                with audio_list_container:
+                    for a in audios:
+                        active_cls = ""
+                        if st.session_state["book_audio_sel"] == a["id"]:
+                            active_cls = " active"
+
+                        col_info, col_play, col_del = st.columns([5, 1, 1])
+                        with col_info:
+                            st.markdown(
+                                f'<div class="audio-item{active_cls}">'
+                                f'<div class="audio-track">{a["position"]:02d}. {a["title"]}</div>'
+                                f'<div class="audio-sub">{a["duration_note"] or ""}</div>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                        with col_play:
+                            if st.button(
+                                    "▶",
+                                    key=f"play_audio_{a['id']}",
+                                    use_container_width=True,
+                                    help="Слушать",
+                            ):
+                                st.session_state["book_audio_sel"] = a["id"]
+                                st.rerun()
+                        with col_del:
+                            if st.button(
+                                    "🗑",
+                                    key=f"del_audio_{a['id']}",
+                                    use_container_width=True,
+                                    help="Удалить",
+                            ):
+                                delete_book_audio(a["id"])
+                                if st.session_state["book_audio_sel"] == a["id"]:
+                                    st.session_state["book_audio_sel"] = None
+                                st.rerun()
+
+                # Плеер вынесен за пределы прокручиваемого списка — он всегда виден
+                sel_id = st.session_state["book_audio_sel"]
+                sel_row = next((x for x in audios if x["id"] == sel_id), None) if sel_id else None
+                if sel_row:
+                    audio_file = APP_DIR / sel_row["audio_path"]
+                    if audio_file.exists():
+                        st.markdown(f"**Сейчас играет:** {sel_row['title']}")
+                        st.audio(audio_file.read_bytes())
+                else:
+                    st.caption("Выберите трек, чтобы включить воспроизведение.")
+
+        st.divider()
+        st.divider()
+        st.markdown("### Управление аудио")
+
+        tab_one, tab_many, tab_zip = st.tabs(
+            ["Один файл", "Несколько файлов", "ZIP-архив"]
+        )
+
+        # --- Один файл ---
+        with tab_one:
+            with st.form(f"add_audio_form_{book_id}", clear_on_submit=True):
+                a_title = st.text_input(
+                    "Название трека",
+                    placeholder="Например: Lektion 1 — Hören",
+                )
+                a_note = st.text_input(
+                    "Пометка (необязательно)",
+                    placeholder="стр. 12 / 2:34",
+                )
+                a_file = st.file_uploader(
+                    "Аудиофайл",
+                    type=["mp3", "m4a", "wav", "ogg", "aac", "flac", "opus"],
+                    key=f"one_audio_{book_id}",
+                )
+                if st.form_submit_button("➕ Добавить аудио", type="primary"):
+                    if not a_file:
+                        st.error("Выберите аудиофайл.")
+                    else:
+                        add_book_audio(
+                            book_id,
+                            a_title or Path(a_file.name).stem,
+                            a_file.getvalue(),
+                            a_file.name,
+                            a_note,
+                        )
+                        st.success("Аудио добавлено.")
+                        st.rerun()
+
+        # --- Несколько файлов ---
+        with tab_many:
+            a_files = st.file_uploader(
+                "Аудиофайлы (можно выбрать несколько сразу)",
+                type=["mp3", "m4a", "wav", "ogg", "aac", "flac", "opus"],
+                accept_multiple_files=True,
+                key=f"many_audio_{book_id}",
+            )
+            if st.button("➕ Добавить выбранные файлы", type="primary",
+                         key=f"many_audio_btn_{book_id}"):
+                if not a_files:
+                    st.error("Выберите хотя бы один файл.")
+                else:
+                    result = add_book_audio_bulk(
+                        book_id,
+                        [{"name": f.name, "bytes": f.getvalue()} for f in a_files],
+                    )
+                    if result["added"]:
+                        st.success(f"Добавлено файлов: {result['added']}.")
+                    if result["skipped"]:
+                        st.warning(
+                            "Пропущены (не аудио или пустые): "
+                            + ", ".join(result["skipped"][:10])
+                            + ("…" if len(result["skipped"]) > 10 else "")
+                        )
+                    for err in result["errors"]:
+                        st.error(err)
+                    st.rerun()
+
+        # --- ZIP-архив (рекомендуется для папок) ---
+        with tab_zip:
+            st.caption(
+                "Загрузите ZIP-архив с аудиофайлами — названия треков будут взяты "
+                "из имён файлов (без расширения, `_` заменятся на пробел)."
+            )
+            zip_file = st.file_uploader(
+                "ZIP-архив с аудио",
+                type=["zip"],
+                key=f"zip_audio_{book_id}",
+            )
+            if st.button("📦 Распаковать и добавить всё аудио", type="primary",
+                         key=f"zip_audio_btn_{book_id}"):
+                if not zip_file:
+                    st.error("Выберите ZIP-архив.")
+                else:
+                    try:
+                        files = extract_audio_files_from_zip(zip_file.getvalue())
+                    except Exception as exc:
+                        logger.exception("Не удалось прочитать ZIP")
+                        st.error(f"Ошибка чтения архива: {exc}")
+                        files = []
+
+                    if not files:
+                        st.warning(
+                            "В архиве не найдено аудиофайлов (mp3/m4a/wav/ogg/aac/flac/opus)."
+                        )
+                    else:
+                        result = add_book_audio_bulk(book_id, files)
+                        if result["added"]:
+                            st.success(f"Добавлено треков: {result['added']}.")
+                        if result["skipped"]:
+                            st.warning(
+                                f"Пропущено файлов: {len(result['skipped'])} "
+                                f"(не аудио или пустые)."
+                            )
+                        for err in result["errors"]:
+                            st.error(err)
+                        st.rerun()
+    else:
+        # ---- Полка ----
+        tab_shelf, tab_add = st.tabs(["Полка", "Добавить учебник"])
+
+        with tab_add:
+            with st.form("add_book_form", clear_on_submit=True):
+                b_title = st.text_input("Название учебника", placeholder="Menschen A2.1")
+                b_author = st.text_input("Автор(ы)", placeholder="Sandra Evans, Angela Pude")
+                b_level = st.text_input("Уровень", placeholder="A2.1")
+                b_note = st.text_area("Заметка", height=80)
+                b_cover = st.file_uploader("Обложка (изображение)",
+                                           type=["jpg", "jpeg", "png", "webp"])
+                b_pdf = st.file_uploader("PDF учебника", type=["pdf"])
+                if st.form_submit_button("📥 Добавить в библиотеку", type="primary"):
+                    if not b_title.strip():
+                        st.error("Укажите название.")
+                    else:
+                        create_book(
+                            b_title,
+                            b_author,
+                            b_level,
+                            b_note,
+                            b_cover.getvalue() if b_cover else b"",
+                            b_cover.name if b_cover else "",
+                            b_pdf.getvalue() if b_pdf else b"",
+                            b_pdf.name if b_pdf else "",
+                        )
+                        st.success("Учебник добавлен.")
+                        st.rerun()
+
+        with tab_shelf:
+            books = list_books()
+            if not books:
+                st.info("Полка пуста. Загрузите первый учебник во вкладке «Добавить учебник».")
+            else:
+                cols = st.columns(4)
+                for idx, b in enumerate(books):
+                    col = cols[idx % 4]
+                    with col:
+                        cover_html = ""
+                        if b["cover_path"]:
+                            cover_file = APP_DIR / b["cover_path"]
+                            if cover_file.exists():
+                                import base64
+                                b64 = base64.b64encode(cover_file.read_bytes()).decode("utf-8")
+                                cover_html = (
+                                    f'<img class="book-cover" '
+                                    f'src="data:image/jpeg;base64,{b64}" '
+                                    f'alt="{b["title"]}"/>'
+                                )
+                        if not cover_html:
+                            cover_html = f'<div class="book-cover">{b["title"]}</div>'
+                        st.markdown(
+                            f'<div class="book-card">{cover_html}'
+                            f'<div class="book-title">{b["title"]}</div>'
+                            f'<div class="book-meta">{b["author"] or "—"} · {b["level"] or "—"}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                        btn1, btn2 = st.columns(2)
+                        with btn1:
+                            if st.button("📖 Открыть", key=f"open_book_{b['id']}",
+                                         use_container_width=True):
+                                st.session_state["book_reader_id"] = b["id"]
+                                st.session_state["book_audio_sel"] = None
+                                st.rerun()
+                        with btn2:
+                            if st.button("🗑", key=f"del_book_{b['id']}",
+                                         use_container_width=True):
+                                delete_book(b["id"])
+                                st.rerun()
+
+
+# =====================================================================
 #                          УРОКИ И ТРАНСКРИПТЫ
 # =====================================================================
 elif page == "Уроки и транскрипты":
@@ -1935,6 +2522,34 @@ elif page == "Группы":
                 delete_group(gid)
                 st.warning("Группа удалена.")
                 st.rerun()
+
+            st.divider()
+
+            st.markdown("### Учебник группы")
+            all_books = list_books()
+            current_book = get_group_book(gid)
+            if not all_books:
+                st.caption("В библиотеке пока нет учебников. Добавьте их во вкладке «Библиотека».")
+            else:
+                book_options = {f"— нет —": None}
+                for b in all_books:
+                    book_options[f"{b['title']} ({b['level'] or '—'})"] = b["id"]
+                default_label = "— нет —"
+                if current_book:
+                    for label, bid in book_options.items():
+                        if bid == current_book["id"]:
+                            default_label = label
+                            break
+                labels = list(book_options.keys())
+                idx = labels.index(default_label) if default_label in labels else 0
+                chosen_label = st.selectbox("Прикрепить учебник", labels, index=idx,
+                                            key=f"gbook_{gid}")
+                if st.button("💾 Сохранить учебник группы", key=f"gbook_save_{gid}"):
+                    set_group_book(gid, book_options[chosen_label])
+                    st.success("Учебник группы обновлён.")
+                    st.rerun()
+                if current_book:
+                    st.caption(f"Текущий учебник: **{current_book['title']}**")
 
             st.divider()
 
