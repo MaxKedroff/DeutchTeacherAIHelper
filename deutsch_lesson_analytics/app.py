@@ -16,6 +16,7 @@ import pandas as pd
 import streamlit.components.v1 as components
 from pypdf import PdfReader
 
+
 # ---------- Санитайзер JSON для ответов LLM ----------
 def _sanitize_json(text: str) -> str:
     text = re.sub(r",(\s*[}\]])", r"\1", text)
@@ -330,7 +331,7 @@ def init_db():
             book_id INTEGER NOT NULL REFERENCES library_books(id) ON DELETE CASCADE,
             assigned_at TEXT NOT NULL
         );
-        
+
         CREATE TABLE IF NOT EXISTS book_chapters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             book_id INTEGER NOT NULL REFERENCES library_books(id) ON DELETE CASCADE,
@@ -351,6 +352,16 @@ def init_db():
             translation TEXT DEFAULT '',
             example TEXT DEFAULT '',
             pos TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        
+        CREATE TABLE IF NOT EXISTS lesson_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            planned_lesson_id INTEGER NOT NULL UNIQUE REFERENCES planned_lessons(id) ON DELETE CASCADE,
+            chapter_id INTEGER REFERENCES book_chapters(id) ON DELETE SET NULL,
+            total_minutes INTEGER NOT NULL DEFAULT 60,
+            blocks_json TEXT NOT NULL,
+            source TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
         """)
@@ -598,6 +609,143 @@ def get_today_attention_items(horizon_hours: int = 48) -> list[dict]:
         })
 
     return items
+
+
+def get_group_progress_matrix(group_id: int, last_n_lessons: int = 15) -> dict:
+    """
+    Возвращает данные для матрицы «ученик × занятие».
+
+    {
+      "lessons": [{id, scheduled_at, title, date_str}],   # только проведённые, последние N
+      "students": [{id, name}],
+      "cells": {(student_id, planned_lesson_id): {attended, hw_state}},
+      "observations": {(student_id, planned_lesson_id): count_obs}
+    }
+    """
+    with db() as con:
+        # Последние N проведённых занятий группы
+        lessons = con.execute("""
+            SELECT pl.id, pl.scheduled_at, pl.title, pl.lesson_id
+            FROM planned_lessons pl
+            WHERE pl.group_id = ?
+              AND pl.is_conducted = 1
+            ORDER BY pl.scheduled_at DESC
+            LIMIT ?
+        """, (group_id, int(last_n_lessons))).fetchall()
+        lessons = list(reversed(lessons))  # от старых к новым
+
+        # Ученики группы
+        students = con.execute("""
+            SELECT s.id, s.name FROM students s
+            JOIN group_students gs ON gs.student_id = s.id
+            WHERE gs.group_id = ?
+            ORDER BY s.name COLLATE NOCASE
+        """, (group_id,)).fetchall()
+
+        if not lessons or not students:
+            return {"lessons": [], "students": [], "cells": {}, "observations": {}}
+
+        lesson_ids = [r["id"] for r in lessons]
+        placeholders = ",".join("?" * len(lesson_ids))
+
+        # Домашка: (planned_lesson_id, student_id) → is_done
+        hw_rows = con.execute(f"""
+            SELECT planned_lesson_id, student_id, is_done
+            FROM homework_status
+            WHERE planned_lesson_id IN ({placeholders})
+        """, lesson_ids).fetchall()
+        hw_map = {(r["planned_lesson_id"], r["student_id"]): bool(r["is_done"]) for r in hw_rows}
+
+        # Дедлайны домашек
+        due_map = {
+            r["id"]: (r["homework_due_date"] or "")
+            for r in lessons
+        }
+        # Даты домашних заданий в карточке лежат в planned_lessons, а не в lessons-выборке
+        due_rows = con.execute(f"""
+            SELECT id, homework_due_date FROM planned_lessons
+            WHERE id IN ({placeholders})
+        """, lesson_ids).fetchall()
+        due_map = {r["id"]: (r["homework_due_date"] or "") for r in due_rows}
+
+        # Посещение: считается, что ученик был, если есть хотя бы один его сегмент
+        # на привязанном к карточке уроке (planned_lessons.lesson_id).
+        lesson_of_pl = {r["id"]: r["lesson_id"] for r in lessons}
+        attended_map = set()
+        real_lesson_ids = [lid for lid in lesson_of_pl.values() if lid]
+        if real_lesson_ids:
+            ph2 = ",".join("?" * len(real_lesson_ids))
+            att_rows = con.execute(f"""
+                SELECT DISTINCT lesson_id, student_id
+                FROM segments
+                WHERE lesson_id IN ({ph2})
+                  AND student_id IS NOT NULL
+            """, real_lesson_ids).fetchall()
+            att_by_lesson = {}
+            for r in att_rows:
+                att_by_lesson.setdefault(r["lesson_id"], set()).add(r["student_id"])
+            for pl_id, lid in lesson_of_pl.items():
+                if not lid:
+                    continue
+                for sid in att_by_lesson.get(lid, set()):
+                    attended_map.add((sid, pl_id))
+
+        # Наблюдения по ученику на уроке
+        obs_count: dict[tuple[int, int], int] = {}
+        if real_lesson_ids:
+            ph2 = ",".join("?" * len(real_lesson_ids))
+            obs_rows = con.execute(f"""
+                SELECT lesson_id, student_id, COUNT(*) n
+                FROM observations
+                WHERE lesson_id IN ({ph2})
+                  AND student_id IS NOT NULL
+                GROUP BY lesson_id, student_id
+            """, real_lesson_ids).fetchall()
+            obs_by_lesson = {(r["lesson_id"], r["student_id"]): r["n"] for r in obs_rows}
+            for pl_id, lid in lesson_of_pl.items():
+                if not lid:
+                    continue
+                for stu in students:
+                    n = obs_by_lesson.get((lid, stu["id"]))
+                    if n:
+                        obs_count[(stu["id"], pl_id)] = n
+
+    today_iso = date.today().isoformat()
+
+    cells = {}
+    for stu in students:
+        for les in lessons:
+            key = (stu["id"], les["id"])
+            attended = key in attended_map
+            if key in hw_map:
+                is_done = hw_map[key]
+                if is_done:
+                    hw_state = "done"
+                else:
+                    due = due_map.get(les["id"], "")
+                    hw_state = "overdue" if (due and due < today_iso) else "pending"
+            else:
+                hw_state = "none"
+            cells[key] = {"attended": attended, "hw_state": hw_state}
+
+    # Строки для дат занятий
+    lesson_rows = []
+    for r in lessons:
+        dt = datetime.fromisoformat(r["scheduled_at"])
+        lesson_rows.append({
+            "id": r["id"],
+            "scheduled_at": r["scheduled_at"],
+            "title": r["title"] or "— без темы —",
+            "date_str": dt.strftime("%d.%m"),
+            "weekday": WEEKDAYS_RU[dt.weekday()],
+        })
+
+    return {
+        "lessons": lesson_rows,
+        "students": [dict(s) for s in students],
+        "cells": cells,
+        "observations": obs_count,
+    }
 
 
 # ---------- Группы ----------
@@ -942,6 +1090,7 @@ def extract_audio_files_from_zip(zip_bytes: bytes) -> list[dict]:
                 logger.exception("Не удалось прочитать %s из архива", info.filename)
     return result
 
+
 def delete_book_audio(audio_id):
     with db() as con:
         row = con.execute("SELECT audio_path FROM library_audio WHERE id=?", (audio_id,)).fetchone()
@@ -1072,11 +1221,277 @@ def set_chapter_glossary(chapter_id, items):
                 ),
             )
 
+
 def clear_chapter_glossary(chapter_id) -> int:
     """Удаляет все записи глоссария для главы. Возвращает число удалённых."""
     with db() as con:
         cur = con.execute("DELETE FROM book_glossaries WHERE chapter_id=?", (chapter_id,))
         return cur.rowcount
+
+
+# ---------- Конструктор урока ----------
+def get_lesson_plan(planned_id: int) -> dict | None:
+    with db() as con:
+        row = con.execute(
+            "SELECT * FROM lesson_plans WHERE planned_lesson_id=?", (planned_id,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        blocks = json.loads(row["blocks_json"])
+    except Exception:
+        blocks = []
+    return {
+        "id": row["id"],
+        "chapter_id": row["chapter_id"],
+        "total_minutes": row["total_minutes"],
+        "blocks": blocks,
+        "source": row["source"],
+        "created_at": row["created_at"],
+    }
+
+
+def save_lesson_plan(planned_id: int, chapter_id: int | None, blocks: list[dict],
+                     total_minutes: int, source: str):
+    with db() as con:
+        con.execute(
+            "INSERT INTO lesson_plans(planned_lesson_id, chapter_id, total_minutes, blocks_json, source, created_at) "
+            "VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(planned_lesson_id) DO UPDATE SET "
+            "chapter_id=excluded.chapter_id, total_minutes=excluded.total_minutes, "
+            "blocks_json=excluded.blocks_json, source=excluded.source, created_at=excluded.created_at",
+            (planned_id, chapter_id, total_minutes,
+             json.dumps(blocks, ensure_ascii=False),
+             source, datetime.now().isoformat(timespec="seconds")),
+        )
+
+
+def delete_lesson_plan(planned_id: int):
+    with db() as con:
+        con.execute("DELETE FROM lesson_plans WHERE planned_lesson_id=?", (planned_id,))
+
+
+def _shuffle_words(glossary: list[dict], n: int = 10) -> list[dict]:
+    """Берёт до n случайных слов из глоссария (без повторов)."""
+    import random
+    if not glossary:
+        return []
+    seen = set()
+    pool = []
+    for g in glossary:
+        w = (g["word"] or "").strip()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        pool.append(dict(g))
+    random.shuffle(pool)
+    return pool[:n]
+
+
+def build_lesson_plan_from_glossary(glossary: list[dict], chapter_title: str,
+                                     level: str = "", total_minutes: int = 60) -> list[dict]:
+    """
+    Собирает блоки плана из глоссария.
+    Список блоков:
+      [{type, title, minutes, items:[{word, translation, example}], note}]
+    Если глоссарий пуст — возвращает пустой список.
+    """
+    if not glossary:
+        return []
+
+    # Сортируем по частям речи
+    nouns = [g for g in glossary if (g.get("pos") or "").lower().startswith("noun") or
+             re.match(r"^(der|die|das)\s", (g.get("word") or ""), flags=re.IGNORECASE)]
+    verbs = [g for g in glossary if (g.get("pos") or "").lower().startswith("verb")]
+    others = [g for g in glossary if g not in nouns and g not in verbs]
+
+    warmup_words = _shuffle_words(glossary, 5)
+    lex_words = _shuffle_words(nouns + others, 12)
+    grammar_words = _shuffle_words(verbs, 8) or _shuffle_words(glossary, 6)
+    listening_words = _shuffle_words(nouns, 6)
+    speaking_words = _shuffle_words(glossary, 8)
+    homework_words = _shuffle_words(glossary, 10)
+
+    # Распределяем время пропорционально
+    base = max(45, int(total_minutes))
+    minutes = {
+        "warmup": max(3, round(base * 0.08)),
+        "vocab": max(5, round(base * 0.20)),
+        "grammar": max(5, round(base * 0.25)),
+        "listening": max(5, round(base * 0.17)),
+        "speaking": max(5, round(base * 0.20)),
+        "homework": max(3, round(base * 0.10)),
+    }
+    # Подгоняем, чтобы сумма совпадала с base
+    diff = base - sum(minutes.values())
+    if diff != 0:
+        minutes["vocab"] = max(3, minutes["vocab"] + diff)
+
+    def block(btype, title, items, note, key):
+        return {
+            "type": btype,
+            "title": title,
+            "minutes": int(minutes[key]),
+            "items": items,
+            "note": note,
+        }
+
+    blocks = [
+        block(
+            "warmup",
+            f"Разминка: «{chapter_title}»",
+            [{"word": w["word"], "translation": w.get("translation", "")} for w in warmup_words],
+            "Быстрый опрос — ученики вспоминают слова из прошлой темы.",
+            "warmup",
+        ),
+        block(
+            "vocab",
+            "Лексика: новые слова",
+            [{"word": w["word"], "translation": w.get("translation", ""),
+              "example": w.get("example", "")} for w in lex_words],
+            "Прочитать, повторить, использовать в мини-предложениях.",
+            "vocab",
+        ),
+        block(
+            "grammar",
+            "Грамматика: глаголы и конструкции",
+            [{"word": w["word"], "translation": w.get("translation", ""),
+              "example": w.get("example", "")} for w in grammar_words],
+            "Отработать спряжение/управление на примерах из глоссария.",
+            "grammar",
+        ),
+        block(
+            "listening",
+            "Аудирование",
+            [{"word": w["word"], "translation": w.get("translation", "")} for w in listening_words],
+            "Прослушать трек, выписать услышанные слова из списка.",
+            "listening",
+        ),
+        block(
+            "speaking",
+            "Говорение в парах",
+            [{"word": w["word"], "translation": w.get("translation", "")} for w in speaking_words],
+            "Диалог на тему урока с использованием 3–4 новых слов.",
+            "speaking",
+        ),
+        block(
+            "homework",
+            "Домашнее задание",
+            [{"word": w["word"], "translation": w.get("translation", "")} for w in homework_words],
+            "Составить 5–7 предложений с лексикой урока.",
+            "homework",
+        ),
+    ]
+    return blocks
+
+
+def _render_lesson_plan_block(pl, *, key_base: str, compact: bool = False):
+    """
+    Рисует блок «План урока» для карточки занятия.
+    План собирается из глоссария привязанного к группе учебника
+    (или из глоссария выбранного в теме урока главы, если она найдена).
+    """
+    with db() as con:
+        group_row = con.execute(
+            "SELECT id FROM groups WHERE name=?", (pl["group_name"] or "",)
+        ).fetchone()
+    if not group_row:
+        return
+    group_id = group_row["id"]
+
+    # Ищем главу, соответствующую текущей теме занятия
+    chapter = None
+    chapter_glossary: list[dict] = []
+    book = get_group_book(group_id)
+    title_now = (pl["title"] or "").strip()
+    if book and title_now:
+        with db() as con:
+            ch_row = con.execute(
+                "SELECT * FROM book_chapters WHERE book_id=? AND title=? "
+                "ORDER BY position LIMIT 1",
+                (book["id"], title_now),
+            ).fetchone()
+        if ch_row:
+            chapter = dict(ch_row)
+            chapter_glossary = [dict(g) for g in get_chapter_glossary(ch_row["id"])]
+
+    plan = get_lesson_plan(pl["id"])
+
+    with st.expander(
+        f"🧩 План урока" + (" (есть)" if plan else ""),
+        expanded=False,
+    ):
+        if plan:
+            # ---- Отображение существующего плана ----
+            st.caption(
+                f"Источник: {plan['source'] or '—'} · "
+                f"Итого: {plan['total_minutes']} мин · "
+                f"Создан: {plan['created_at']}"
+            )
+            for blk in plan["blocks"]:
+                st.markdown(
+                    f"**{blk.get('title', '')}** · ⏱ {blk.get('minutes', '—')} мин"
+                )
+                if blk.get("note"):
+                    st.caption(blk["note"])
+                items = blk.get("items") or []
+                if items:
+                    rows = []
+                    for it in items:
+                        w = it.get("word", "")
+                        tr = it.get("translation", "")
+                        ex = it.get("example", "")
+                        rows.append({"Слово": w, "Перевод": tr, "Пример": ex})
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                                 hide_index=True)
+            c_save, c_clear = st.columns([2, 1])
+            with c_clear:
+                if st.button("🧹 Удалить план", key=f"{key_base}_plan_del",
+                             use_container_width=True):
+                    delete_lesson_plan(pl["id"])
+                    st.rerun()
+            return
+
+        # ---- Генерация ----
+        if not chapter:
+            st.caption(
+                "Не удалось найти главу учебника, соответствующую теме занятия. "
+                "Задайте тему из списка (по учебнику группы) — тогда глоссарий "
+                "и план соберутся автоматически."
+            )
+            return
+        if not chapter_glossary:
+            st.caption(
+                f"Для главы «{chapter['title']}» ещё не составлен глоссарий. "
+                "Откройте «Библиотека → 🎯 Задания», выберите урок и нажмите "
+                "«Составить глоссарий по уроку»."
+            )
+            return
+
+        total_min = st.number_input(
+            "Длительность занятия (мин)",
+            min_value=30, max_value=180,
+            value=60, step=5,
+            key=f"{key_base}_plan_min",
+        )
+        if st.button("✨ Собрать план из глоссария", type="primary",
+                     use_container_width=True):
+            blocks = build_lesson_plan_from_glossary(
+                chapter_glossary,
+                chapter_title=chapter["title"],
+                level=book["level"] if book else "",
+                total_minutes=int(total_min),
+            )
+            save_lesson_plan(
+                pl["id"],
+                chapter_id=chapter["id"],
+                blocks=blocks,
+                total_minutes=int(total_min),
+                source=f"глоссарий: {chapter['title']}",
+            )
+            st.success(f"План собран: {len(blocks)} блоков.")
+            st.rerun()
+
 
 # ---------- Задания по книге: PDF ----------
 def read_pdf_text(book_pdf_path: str) -> tuple[str, int]:
@@ -1355,7 +1770,7 @@ def analyze_chapter_glossary(book_row, chapter_row) -> dict:
             continue
         # отбрасываем, если слова нет в тексте (учитываем корень)
         if core and core not in text_lower and not re.search(
-            rf"\b{re.escape(core[:max(4, len(core) - 3)])}", text_lower
+                rf"\b{re.escape(core[:max(4, len(core) - 3)])}", text_lower
         ):
             # если совсем не нашли — всё равно оставим только если слово короткое (артикль и т.п.),
             # иначе выкидываем
@@ -1457,6 +1872,9 @@ def render_planned_card_editor(pl, *, key_prefix: str, compact: bool = False):
 
     if pl["lesson_id"]:
         st.caption(f"✅ Урок загружен (lesson #{pl['lesson_id']})")
+
+    _render_lesson_plan_block(pl, key_base=key_base, compact=compact)
+
 
     due_val = pl["homework_due_date"] or ""
     due_label = "Дедлайн домашки" if not compact else "Дедлайн ДЗ"
@@ -1688,7 +2106,6 @@ AI_SYSTEM_PROMPT = """Ты — ассистент преподавателя н�
 5. После удаления всегда возвращай отчёт: какой id, группа, дата, тема.
 """.replace("{teacher}", TEACHER_NAME)
 
-
 AI_SQL_TOOL_SCHEMA = {
     "name": "run_sql",
     "description": (
@@ -1711,7 +2128,6 @@ AI_SQL_TOOL_SCHEMA = {
     },
 }
 
-
 _AI_FORBIDDEN_KEYWORDS = (
     "insert", "update", "delete", "drop", "alter", "create", "replace",
     "attach", "detach", "pragma", "vacuum", "truncate", "grant", "revoke",
@@ -1731,7 +2147,6 @@ _GLOSSARY_STOPWORDS = {
     "vor", "hinter", "für", "gegen", "ohne", "um", "durch",
     "größe", "person", "leute", "sache", "ding", "stück",
 }
-
 
 # ---------- Транслитерация RU -> LAT для сопоставления имён ----------
 _TRANSLIT_MAP = {
@@ -1805,11 +2220,11 @@ def ai_find_student(query: str) -> dict:
 
 
 def ai_delete_planned_lesson(
-    planned_lesson_id: int | None = None,
-    group_name: str | None = None,
-    lesson_date: str | None = None,
-    title: str | None = None,
-    allow_with_lesson: bool = False,
+        planned_lesson_id: int | None = None,
+        group_name: str | None = None,
+        lesson_date: str | None = None,
+        title: str | None = None,
+        allow_with_lesson: bool = False,
 ) -> dict:
     def _row_to_dict(r):
         return {
@@ -2187,7 +2602,6 @@ with st.sidebar:
     st.caption("SQLite · локальное хранение")
     st.caption(f"Преподаватель: {TEACHER_NAME}")
 
-
 # =====================================================================
 #                                  ОБЗОР
 # =====================================================================
@@ -2216,9 +2630,9 @@ if page == "Обзор":
                 st.caption(item["detail"])
             with col_btn:
                 if st.button(
-                    item["action_label"],
-                    key=f"attention_btn_{item['kind']}_{abs(hash(item['title'])) % 100000}",
-                    use_container_width=True,
+                        item["action_label"],
+                        key=f"attention_btn_{item['kind']}_{abs(hash(item['title'])) % 100000}",
+                        use_container_width=True,
                 ):
                     target = item["action"].get("nav")
                     if target:
@@ -2255,7 +2669,7 @@ if page == "Обзор":
                      "none": ("", "")}[hw]
             badge_html = f'<span class="hw-badge {badge[1]}">{badge[0]}</span>' if badge[0] else ""
             st.markdown(
-                f"""<div class="cal-card {'overdue' if hw=='overdue' else ''}">
+                f"""<div class="cal-card {'overdue' if hw == 'overdue' else ''}">
                 <h4>{pl['title'] or 'Без темы'} · {pl['group_name']}</h4>
                 <div class="cal-meta">{dt.strftime('%d.%m.%Y %H:%M')} · {'проведено' if pl['is_conducted'] else 'запланировано'}{badge_html}</div>
                 </div>""",
@@ -2519,12 +2933,15 @@ elif page == "Ежедневник":
         if "diary_date_widget" not in st.session_state:
             st.session_state["diary_date_widget"] = st.session_state["diary_ref"]
 
+
         def _diary_sync_from_widget():
             st.session_state["diary_ref"] = st.session_state["diary_date_widget"]
+
 
         def _diary_set(d):
             st.session_state["diary_ref"] = d
             st.session_state["diary_date_widget"] = d
+
 
         top1, top2, top3 = st.columns([2, 2, 2])
         with top1:
@@ -2587,6 +3004,7 @@ elif page == "Ежедневник":
             d = datetime.fromisoformat(pl["scheduled_at"]).date()
             by_day.setdefault(d, []).append(pl)
 
+
         def _event_html(pl):
             dt = datetime.fromisoformat(pl["scheduled_at"])
             hw = homework_state(pl)
@@ -2611,10 +3029,12 @@ elif page == "Ежедневник":
                 f'</div>'
             )
 
+
         def open_in_calendar(target_date: date):
             st.session_state["diary_ref_date"] = target_date
             st.session_state["pending_nav"] = "Календарь"
             st.rerun()
+
 
         if view_mode == "Неделя":
             days = [range_start + timedelta(days=i) for i in range(7)]
@@ -2857,9 +3277,9 @@ elif page == "Библиотека":
                         if ch["page_from"] and ch["page_to"]:
                             pages = f" · стр. {ch['page_from']}–{ch['page_to']}"
                         if st.button(
-                            f"📁 {ch['title']}{pages}",
-                            key=f"open_chapter_{ch['id']}",
-                            use_container_width=True,
+                                f"📁 {ch['title']}{pages}",
+                                key=f"open_chapter_{ch['id']}",
+                                use_container_width=True,
                         ):
                             st.session_state["book_tasks_chapter"] = ch["id"]
                             st.rerun()
@@ -3200,6 +3620,7 @@ elif page == "Библиотека":
                             cover_file = APP_DIR / b["cover_path"]
                             if cover_file.exists():
                                 import base64
+
                                 b64 = base64.b64encode(cover_file.read_bytes()).decode("utf-8")
                                 cover_html = (
                                     f'<img class="book-cover" '
@@ -3544,6 +3965,8 @@ elif page == "Ученики":
                 if r["due_date"] and r["due_date"] < date.today().isoformat():
                     return "🔴 просрочено"
                 return "🟡 ожидается"
+
+
             hw_log["статус"] = hw_log.apply(_hw_label, axis=1)
             st.dataframe(
                 hw_log[["lesson_at", "lesson_title", "due_date", "статус"]],
