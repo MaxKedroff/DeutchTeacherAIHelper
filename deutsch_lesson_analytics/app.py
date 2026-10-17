@@ -14,7 +14,7 @@ import zipfile
 import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
-
+from pypdf import PdfReader
 
 # ---------- Санитайзер JSON для ответов LLM ----------
 def _sanitize_json(text: str) -> str:
@@ -330,7 +330,31 @@ def init_db():
             book_id INTEGER NOT NULL REFERENCES library_books(id) ON DELETE CASCADE,
             assigned_at TEXT NOT NULL
         );
+        
+        CREATE TABLE IF NOT EXISTS book_chapters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER NOT NULL REFERENCES library_books(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL,
+            page_from INTEGER,
+            page_to INTEGER,
+            summary TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        -- NEW: глоссарии по уроку
+        CREATE TABLE IF NOT EXISTS book_glossaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chapter_id INTEGER NOT NULL REFERENCES book_chapters(id) ON DELETE CASCADE,
+            word TEXT NOT NULL,
+            article TEXT DEFAULT '',
+            translation TEXT DEFAULT '',
+            example TEXT DEFAULT '',
+            pos TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         """)
+
         ensure_student(con, TEACHER_NAME)
 
 
@@ -826,6 +850,356 @@ def get_group_book_by_name(group_name):
         return get_group_book(row["id"])
 
 
+# ---------- Задания по книге: доступ к данным ----------
+def list_book_chapters(book_id):
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM book_chapters WHERE book_id=? ORDER BY position, id",
+            (book_id,),
+        ).fetchall()
+
+
+def get_chapter(chapter_id):
+    with db() as con:
+        return con.execute("SELECT * FROM book_chapters WHERE id=?", (chapter_id,)).fetchone()
+
+
+def add_book_chapter(book_id, title, page_from, page_to, summary, position):
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO book_chapters(book_id, position, title, page_from, page_to, summary, created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (book_id, position, title, page_from, page_to, summary,
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        return cur.lastrowid
+
+
+def clear_book_chapters(book_id):
+    with db() as con:
+        con.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
+
+
+def get_chapter_glossary(chapter_id):
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM book_glossaries WHERE chapter_id=? ORDER BY word COLLATE NOCASE",
+            (chapter_id,),
+        ).fetchall()
+
+
+def set_chapter_glossary(chapter_id, items):
+    with db() as con:
+        con.execute("DELETE FROM book_glossaries WHERE chapter_id=?", (chapter_id,))
+        for it in items:
+            con.execute(
+                "INSERT INTO book_glossaries(chapter_id, word, article, translation, example, pos, created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    chapter_id,
+                    (it.get("word") or "").strip(),
+                    (it.get("article") or "").strip(),
+                    (it.get("translation") or "").strip(),
+                    (it.get("example") or "").strip(),
+                    (it.get("pos") or "").strip(),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+
+def clear_chapter_glossary(chapter_id) -> int:
+    """Удаляет все записи глоссария для главы. Возвращает число удалённых."""
+    with db() as con:
+        cur = con.execute("DELETE FROM book_glossaries WHERE chapter_id=?", (chapter_id,))
+        return cur.rowcount
+
+# ---------- Задания по книге: PDF ----------
+def read_pdf_text(book_pdf_path: str) -> tuple[str, int]:
+    """
+    Возвращает (полный_текст, число_страниц).
+    Если PDF нет или pypdf не установлен — возвращает ("", 0).
+    """
+    if not book_pdf_path:
+        return "", 0
+
+    p = APP_DIR / book_pdf_path
+    if not p.exists():
+        return "", 0
+    try:
+        reader = PdfReader(str(p))
+        pages = []
+        for page in reader.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:
+                pages.append("")
+        return "\n\n".join(pages), len(pages)
+    except Exception:
+        logger.exception("read_pdf_text failed: %s", book_pdf_path)
+        return "", 0
+
+
+def read_pdf_pages(book_pdf_path: str, page_from: int | None, page_to: int | None,
+                   fallback_window: int = 15) -> tuple[str, str]:
+    """
+    Возвращает (текст, источник), где текст — только запрошенный диапазон страниц.
+
+    Если page_from/page_to заданы:
+        берём ровно эти страницы.
+    Если нет — берём первые `fallback_window` страниц (лучше, чем весь учебник).
+
+    Возвращает вторым элементом 'pages' или 'fallback'.
+    """
+    if not book_pdf_path:
+        return "", "empty"
+
+    p = APP_DIR / book_pdf_path
+    if not p.exists():
+        return "", "empty"
+    try:
+        reader = PdfReader(str(p))
+    except Exception:
+        logger.exception("read_pdf_pages: open failed")
+        return "", "empty"
+
+    total = len(reader.pages)
+
+    if page_from and page_to:
+        start = max(1, int(page_from))
+        end = min(total, int(page_to))
+        if start > end:
+            start, end = end, start
+        # ограничим до 30 страниц, чтобы не раздувать запрос
+        end = min(end, start + 30 - 1)
+        text_pages = []
+        for i in range(start - 1, end):
+            try:
+                text_pages.append(reader.pages[i].extract_text() or "")
+            except Exception:
+                text_pages.append("")
+        return "\n\n".join(text_pages), "pages"
+
+    # fallback — первые N страниц
+    n = min(total, max(1, fallback_window))
+    text_pages = []
+    for i in range(n):
+        try:
+            text_pages.append(reader.pages[i].extract_text() or "")
+        except Exception:
+            text_pages.append("")
+    return "\n\n".join(text_pages), "fallback"
+
+
+def chunk_text_for_llm(text: str, max_chars: int = 14000) -> list[str]:
+    """Грубое разбиение длинного текста на куски для LLM."""
+    if not text:
+        return []
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    cur = []
+    cur_len = 0
+    for para in re.split(r"\n\s*\n", text):
+        if cur_len + len(para) > max_chars and cur:
+            chunks.append("\n\n".join(cur))
+            cur, cur_len = [], 0
+        cur.append(para)
+        cur_len += len(para) + 2
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+# ---------- Задания по книге: запросы к GigaChat ----------
+def _giga_client():
+    from gigachat import GigaChat
+    credentials = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+    if not credentials:
+        raise RuntimeError("Не задан GIGACHAT_CREDENTIALS.")
+    return GigaChat(
+        credentials=credentials,
+        base_url="https://api.giga.chat/v1",
+        model="GigaChat-3-Ultra",
+        verify_ssl_certs=False,
+        max_tokens=20000,
+    )
+
+
+def _extract_json(text: str) -> dict | None:
+    if not text:
+        return None
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(_sanitize_json(m.group(0)))
+    except Exception:
+        logger.exception("extract_json failed")
+        return None
+
+
+def analyze_book_structure(book_row) -> dict:
+    """
+    Просит модель вернуть список уроков книги: [{title, page_from, page_to, summary}, ...].
+    Работает с первой половиной текста PDF (обычно содержание книги + первые юниты).
+    """
+    text, n_pages = read_pdf_text(book_row["pdf_path"])
+    if not text:
+        return {"error": "Не удалось извлечь текст из PDF."}
+
+    # Ограничим длину: первые ~30k символов хватает для оглавления и начала
+    probe = text[:30000]
+
+    prompt = f"""
+Ты — методист по немецкому языку. Ниже — фрагмент учебника «{book_row['title']}»
+(уровень {book_row['level'] or 'не указан'}).
+
+Определи, из каких уроков (Lektionen/Units/Kapitel) состоит книга, и верни их
+в порядке следования. Для каждого укажи:
+- title — как он называется в книге;
+- page_from, page_to — номера страниц (если можешь определить по разметке);
+- summary — 1–2 предложения о содержании.
+
+Верни ТОЛЬКО валидный JSON, без markdown-обёрток:
+{{
+  "chapters": [
+    {{"title": "Lektion 1 — Hallo!", "page_from": 10, "page_to": 27, "summary": "..."}}
+  ]
+}}
+
+Если разбиение по страницам неочевидно — поставь page_from/page_to = null.
+Уроков обычно 8–12. Не придумывай несуществующие.
+
+Текст:
+\"\"\"
+{probe}
+\"\"\"
+"""
+    try:
+        giga = _giga_client()
+        resp = giga.chat(prompt)
+        content = resp.choices[0].message.content or ""
+    except Exception as exc:
+        logger.exception("analyze_book_structure: GigaChat error")
+        return {"error": f"Ошибка GigaChat: {exc}"}
+
+    payload = _extract_json(content)
+    if not payload or not isinstance(payload.get("chapters"), list):
+        return {"error": "Модель вернула неожиданный JSON."}
+
+    return {"chapters": payload["chapters"], "pages": n_pages}
+
+
+def analyze_chapter_glossary(book_row, chapter_row) -> dict:
+    """
+    Составляет глоссарий по конкретной главе.
+    Читает только страницы этой главы (или fallback, если страницы неизвестны),
+    чтобы модель не вытаскивала лексику из первой лекции всей книги.
+    """
+    chapter_text, source = read_pdf_pages(
+        book_row["pdf_path"],
+        chapter_row["page_from"],
+        chapter_row["page_to"],
+        fallback_window=15,
+    )
+
+    if not chapter_text.strip():
+        return {"error": "Не удалось извлечь текст для этого урока из PDF."}
+
+    # Мягкий лимит: не гонять 100k символов
+    sample = chapter_text[:24000]
+
+    pages_info = ""
+    if chapter_row["page_from"] and chapter_row["page_to"]:
+        pages_info = (
+            f"Страницы учебника: {chapter_row['page_from']}–{chapter_row['page_to']}."
+        )
+    elif source == "fallback":
+        pages_info = (
+            "ВНИМАНИЕ: точные страницы главы неизвестны. "
+            "Ниже приведён фрагмент начала книги — определи по нему, "
+            "какие слова относятся именно к уроку с указанным названием."
+        )
+
+    prompt = f"""
+Ты — методист немецкого языка, составляешь глоссарий к уроку в учебнике.
+
+Книга: «{book_row['title']}» (уровень {book_row['level'] or '—'}).
+Урок: «{chapter_row['title']}».
+{pages_info}
+
+ЗАДАЧА: выписать ТОЛЬКО ту лексику, которая относится именно к теме этого урока
+и встречается в приведённом тексте. Не брать общеупотребительные слова
+(sein, haben, gehen, und, aber, sehr, gut, auch, nur, doch, immer и т. п.),
+местоимения, артикли, союзы, частицы и базовые глаголы, которые есть в любой главе.
+
+ПРАВИЛА:
+1. Слова должны быть из темы урока — например, если урок про «Wohnen»,
+   то Wohnung, Miete, Umzug, Nachbar, Möbel, etc., а НЕ «Haus» или «gehen»
+   сами по себе.
+2. Существительные — с артиклем (der/die/das). Указывай и в поле `article`,
+   и в поле `word` в форме «die Wohnung».
+3. Для каждого слова дай: перевод на русский, часть речи (noun/verb/adj/adv/phrase),
+   пример из текста урока (короткий, если в тексте есть).
+4. Учитывай уровень книги: для A1–A2 не бери сложную лексику B2+.
+5. Не выдумывай слова, которых нет в тексте.
+6. От 15 до 50 единиц — только релевантных теме.
+
+Верни ТОЛЬКО валидный JSON:
+{{
+  "glossary": [
+    {{
+      "word": "die Wohnung",
+      "article": "die",
+      "translation": "квартира",
+      "pos": "noun",
+      "example": "Ich suche eine neue Wohnung."
+    }}
+  ]
+}}
+
+ТЕКСТ УРОКА:
+\"\"\"
+{sample}
+\"\"\"
+"""
+    try:
+        giga = _giga_client()
+        resp = giga.chat(prompt)
+        content = resp.choices[0].message.content or ""
+    except Exception as exc:
+        logger.exception("analyze_chapter_glossary: GigaChat error")
+        return {"error": f"Ошибка GigaChat: {exc}"}
+
+    payload = _extract_json(content)
+    if not payload or not isinstance(payload.get("glossary"), list):
+        return {"error": "Модель вернула неожиданный JSON."}
+
+    # Постфильтр: убираем слова, которых нет в тексте главы (защита от галлюцинаций)
+    raw_items = payload["glossary"]
+    text_lower = chapter_text.lower()
+    cleaned = []
+    for it in raw_items:
+        word = (it.get("word") or "").strip()
+        if not word:
+            continue
+        # отбрасываем по одному слову из базовых стоп-слов, если модель их добавила
+        core = re.sub(r"^(der|die|das)\s+", "", word, flags=re.IGNORECASE).strip().lower()
+        if core in _GLOSSARY_STOPWORDS:
+            continue
+        # отбрасываем, если слова нет в тексте (учитываем корень)
+        if core and core not in text_lower and not re.search(
+            rf"\b{re.escape(core[:max(4, len(core) - 3)])}", text_lower
+        ):
+            # если совсем не нашли — всё равно оставим только если слово короткое (артикль и т.п.),
+            # иначе выкидываем
+            if len(core) > 4:
+                continue
+        cleaned.append(it)
+
+    return {"glossary": cleaned, "source": source}
+
+
 # ---------- Редактор карточки занятия ----------
 def render_planned_card_editor(pl, *, key_prefix: str, compact: bool = False):
     pl_id = pl["id"]
@@ -1138,6 +1512,21 @@ _AI_FORBIDDEN_KEYWORDS = (
     "insert", "update", "delete", "drop", "alter", "create", "replace",
     "attach", "detach", "pragma", "vacuum", "truncate", "grant", "revoke",
 )
+
+_GLOSSARY_STOPWORDS = {
+    "sein", "haben", "werden", "gehen", "kommen", "machen", "sagen",
+    "sehen", "wissen", "können", "müssen", "wollen", "sollen", "dürfen",
+    "mögen", "und", "aber", "oder", "denn", "weil", "dass", "wenn",
+    "ich", "du", "er", "sie", "es", "wir", "ihr", "man",
+    "mein", "dein", "sein", "ihr", "unser", "euer",
+    "der", "die", "das", "ein", "eine", "einen", "einem", "einer",
+    "sehr", "gut", "auch", "nur", "schon", "noch", "immer", "oft",
+    "hier", "da", "dort", "dann", "jetzt", "heute", "morgen", "gestern",
+    "ja", "nein", "nicht", "kein", "keine",
+    "in", "an", "auf", "mit", "von", "zu", "bei", "nach", "über", "unter",
+    "vor", "hinter", "für", "gegen", "ohne", "um", "durch",
+    "größe", "person", "leute", "sache", "ding", "stück",
+}
 
 
 # ---------- Транслитерация RU -> LAT для сопоставления имён ----------
@@ -2078,9 +2467,231 @@ elif page == "Библиотека":
         st.session_state["book_reader_id"] = None
     if "book_audio_sel" not in st.session_state:
         st.session_state["book_audio_sel"] = None
+    if "book_tasks_id" not in st.session_state:
+        st.session_state["book_tasks_id"] = None
+    if "book_tasks_chapter" not in st.session_state:
+        st.session_state["book_tasks_chapter"] = None
+
+    # ---- Если открыт режим заданий ----
+    if st.session_state["book_tasks_id"]:
+        tasks_book = get_book(st.session_state["book_tasks_id"])
+        if not tasks_book:
+            st.session_state["book_tasks_id"] = None
+            st.rerun()
+
+        top1, top2 = st.columns([3, 1])
+        with top1:
+            st.markdown(f"### 🎯 Задания по книге: {tasks_book['title']}")
+            st.caption(f"{tasks_book['author'] or '—'} · {tasks_book['level'] or '—'}")
+        with top2:
+            if st.button("← К полке", use_container_width=True):
+                st.session_state["book_tasks_id"] = None
+                st.session_state["book_tasks_chapter"] = None
+                st.rerun()
+
+        st.divider()
+
+        # ----- Открыт конкретный урок -----
+        if st.session_state["book_tasks_chapter"]:
+            ch_id = st.session_state["book_tasks_chapter"]
+            chapter = get_chapter(ch_id)
+            if not chapter:
+                st.session_state["book_tasks_chapter"] = None
+                st.rerun()
+
+            bc1, bc2 = st.columns([3, 1])
+            with bc1:
+                st.markdown(f"#### 📖 {chapter['title']}")
+                rng = ""
+                if chapter["page_from"] and chapter["page_to"]:
+                    rng = f" · стр. {chapter['page_from']}–{chapter['page_to']}"
+                st.caption(rng.strip(" ·") or "")
+            with bc2:
+                if st.button("← К списку уроков", use_container_width=True):
+                    st.session_state["book_tasks_chapter"] = None
+                    st.rerun()
+
+            if chapter["summary"]:
+                st.info(chapter["summary"])
+
+            if not (chapter["page_from"] and chapter["page_to"]):
+                st.warning(
+                    "Для этого урока не определены страницы. "
+                    "Глоссарий будет строиться по первым 15 страницам книги — "
+                    "лексика может захватывать соседние главы. "
+                    "Переанализируйте книгу или задайте страницы вручную "
+                    "(пока не поддерживается — доработаем позже)."
+                )
+
+            st.markdown("##### 📚 Глоссарий")
+            glossary = get_chapter_glossary(ch_id)
+            if glossary:
+                df = pd.DataFrame([dict(g) for g in glossary])
+                df = df[["word", "translation", "pos", "example"]]
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "word": "Слово",
+                        "translation": "Перевод",
+                        "pos": "Часть речи",
+                        "example": "Пример",
+                    },
+                )
+            else:
+                st.caption("Глоссарий ещё не составлен.")
+
+            gen_col, clr_col = st.columns([3, 1])
+            with gen_col:
+                if st.button("🧠 Составить глоссарий по уроку", type="primary",
+                             use_container_width=True):
+                    with st.spinner("Читаю PDF и строю глоссарий по теме урока..."):
+                        result = analyze_chapter_glossary(tasks_book, chapter)
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        set_chapter_glossary(ch_id, result["glossary"])
+                        src = result.get("source")
+                        suffix = "" if src == "pages" else " (страницы главы неизвестны — точность ниже)"
+                        st.success(f"Готово. Слов: {len(result['glossary'])}.{suffix}")
+                        st.rerun()
+
+            with clr_col:
+                # Показываем кнопку только если глоссарий есть — иначе нечего чистить
+                if glossary:
+                    confirm_key = f"confirm_clear_glossary_{ch_id}"
+                    if st.session_state.get(confirm_key):
+                        if st.button("✅ Да, удалить", key=f"yes_clear_{ch_id}",
+                                     use_container_width=True):
+                            n = clear_chapter_glossary(ch_id)
+                            st.session_state.pop(confirm_key, None)
+                            st.success(f"Удалено слов: {n}.")
+                            st.rerun()
+                    else:
+                        if st.button("🧹 Обнулить", key=f"ask_clear_{ch_id}",
+                                     use_container_width=True,
+                                     help="Удалить весь глоссарий этой главы"):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
+
+            # Диалог подтверждения
+            confirm_key = f"confirm_clear_glossary_{ch_id}"
+            if st.session_state.get(confirm_key):
+                st.warning(
+                    "Удалить весь глоссарий этого урока? Действие необратимо. "
+                    "Глоссарий можно будет составить заново."
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Отмена", key=f"cancel_clear_{ch_id}",
+                                 use_container_width=True):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+                with c2:
+                    if st.button("Удалить", type="primary",
+                                 key=f"confirm_yes_clear_{ch_id}",
+                                 use_container_width=True):
+                        n = clear_chapter_glossary(ch_id)
+                        st.session_state.pop(confirm_key, None)
+                        st.success(f"Удалено слов: {n}.")
+                        st.rerun()
+
+            st.divider()
+            if st.button("← К списку уроков", key="bottom_back_chapters",
+                         use_container_width=True):
+                st.session_state["book_tasks_chapter"] = None
+                st.rerun()
+
+            st.divider()
+            if st.button("← К списку уроков", key="bottom_back_chapters",
+                         use_container_width=True):
+                st.session_state["book_tasks_chapter"] = None
+                st.rerun()
+        else:
+            # ----- Список уроков (как файловая система) -----
+            chapters = list_book_chapters(tasks_book["id"])
+
+            col_a, col_b = st.columns([3, 2])
+            with col_a:
+                st.markdown("##### 📂 Уроки книги")
+                if not chapters:
+                    st.caption("Уроки ещё не проанализированы.")
+                else:
+                    for i, ch in enumerate(chapters):
+                        pages = ""
+                        if ch["page_from"] and ch["page_to"]:
+                            pages = f" · стр. {ch['page_from']}–{ch['page_to']}"
+                        if st.button(
+                            f"📁 {ch['title']}{pages}",
+                            key=f"open_chapter_{ch['id']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["book_tasks_chapter"] = ch["id"]
+                            st.rerun()
+            with col_b:
+                st.markdown("##### 📊 Сводка")
+                st.metric("Уроков", len(chapters))
+                if chapters:
+                    with db() as con:
+                        total_g = con.execute("""
+                            SELECT COUNT(*) n FROM book_glossaries g
+                            JOIN book_chapters c ON c.id=g.chapter_id
+                            WHERE c.book_id=?
+                        """, (tasks_book["id"],)).fetchone()["n"]
+                    st.metric("Слов в глоссариях", total_g)
+                else:
+                    st.metric("Слов в глоссариях", 0)
+
+            st.divider()
+
+            if not chapters:
+                st.markdown(
+                    "**Книга ещё не разобрана.** Нажмите кнопку ниже, чтобы "
+                    "нейросеть выделила уроки по содержанию PDF."
+                )
+                if st.button("🧠 Проанализировать книгу", type="primary",
+                             use_container_width=True):
+                    with st.spinner("Анализирую структуру книги (может занять ~1 мин)..."):
+                        result = analyze_book_structure(tasks_book)
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        clear_book_chapters(tasks_book["id"])
+                        for i, ch in enumerate(result["chapters"]):
+                            add_book_chapter(
+                                tasks_book["id"],
+                                (ch.get("title") or f"Урок {i + 1}").strip(),
+                                ch.get("page_from"),
+                                ch.get("page_to"),
+                                (ch.get("summary") or "").strip(),
+                                i,
+                            )
+                        st.success(f"Найдено уроков: {len(result['chapters'])}.")
+                        st.rerun()
+            else:
+                if st.button("🔁 Переанализировать книгу",
+                             use_container_width=True):
+                    with st.spinner("Анализирую..."):
+                        result = analyze_book_structure(tasks_book)
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        clear_book_chapters(tasks_book["id"])
+                        for i, ch in enumerate(result["chapters"]):
+                            add_book_chapter(
+                                tasks_book["id"],
+                                (ch.get("title") or f"Урок {i + 1}").strip(),
+                                ch.get("page_from"),
+                                ch.get("page_to"),
+                                (ch.get("summary") or "").strip(),
+                                i,
+                            )
+                        st.success("Структура обновлена.")
+                        st.rerun()
 
     # ---- Если открыт ридер ----
-    if st.session_state["book_reader_id"]:
+    elif st.session_state["book_reader_id"]:
         book_id = st.session_state["book_reader_id"]
         book = get_book(book_id)
         if not book:
@@ -2378,9 +2989,11 @@ elif page == "Библиотека":
                                 st.session_state["book_audio_sel"] = None
                                 st.rerun()
                         with btn2:
-                            if st.button("🗑", key=f"del_book_{b['id']}",
-                                         use_container_width=True):
-                                delete_book(b["id"])
+                            if st.button("🎯 Задания", key=f"tasks_book_{b['id']}",
+                                         use_container_width=True,
+                                         help="Открыть режим заданий по книге"):
+                                st.session_state["book_tasks_id"] = b["id"]
+                                st.session_state["book_tasks_chapter"] = None
                                 st.rerun()
 
 
