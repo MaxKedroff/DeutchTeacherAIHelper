@@ -457,6 +457,149 @@ def get_lesson_list():
         """, con)
 
 
+def get_today_attention_items(horizon_hours: int = 48) -> list[dict]:
+    """
+    Собирает список «что требует внимания» для вкладки «Обзор».
+    Каждый элемент: {kind, emoji, title, detail, action_label, action}.
+    action — dict с полями: nav (страница) и, при необходимости, set_state (dict).
+    """
+    items: list[dict] = []
+    now = datetime.now()
+    horizon_iso = (now + timedelta(hours=horizon_hours)).isoformat(timespec="minutes")
+    now_iso = now.isoformat(timespec="minutes")
+    today_iso = date.today().isoformat()
+
+    with db() as con:
+        # 1) Ближайшие занятия без подготовки
+        upcoming = con.execute("""
+            SELECT pl.id, pl.scheduled_at, pl.title, g.name AS group_name
+            FROM planned_lessons pl
+            JOIN groups g ON g.id = pl.group_id
+            WHERE pl.scheduled_at >= ? AND pl.scheduled_at <= ?
+              AND pl.is_prepared = 0
+              AND pl.is_conducted = 0
+            ORDER BY pl.scheduled_at
+        """, (now_iso, horizon_iso)).fetchall()
+        for r in upcoming:
+            dt = datetime.fromisoformat(r["scheduled_at"])
+            delta_h = max(0, int((dt - now).total_seconds() // 3600))
+            when = "через час" if delta_h < 1 else f"через {delta_h} ч"
+            items.append({
+                "kind": "unprepared_lesson",
+                "emoji": "📅",
+                "title": f"«{r['title'] or 'Без темы'}» · {r['group_name']} — {when}",
+                "detail": "Занятие не подготовлено. Откройте карточку и отметьте подготовку.",
+                "action_label": "Открыть календарь",
+                "action": {"nav": "Календарь"},
+            })
+
+        # 2) Прошедшие занятия, отмеченные «проведено», но урок не загружен
+        missed = con.execute("""
+            SELECT pl.id, pl.scheduled_at, pl.title, g.name AS group_name
+            FROM planned_lessons pl
+            JOIN groups g ON g.id = pl.group_id
+            WHERE pl.is_conducted = 1
+              AND pl.lesson_id IS NULL
+              AND date(pl.scheduled_at) <= date(?)
+            ORDER BY pl.scheduled_at DESC
+            LIMIT 5
+        """, (today_iso,)).fetchall()
+        for r in missed:
+            d = datetime.fromisoformat(r["scheduled_at"]).strftime("%d.%m")
+            items.append({
+                "kind": "conducted_not_uploaded",
+                "emoji": "📥",
+                "title": f"Урок от {d} проведён, но не загружен · {r['group_name']}",
+                "detail": f"«{r['title'] or 'Без темы'}». Загрузите аудио и транскрипт.",
+                "action_label": "Открыть календарь",
+                "action": {"nav": "Календарь"},
+            })
+
+        # 3) Просроченные домашки
+        overdue = con.execute("""
+            SELECT COUNT(*) AS n,
+                   COUNT(DISTINCT hs.student_id) AS students,
+                   GROUP_CONCAT(DISTINCT g.name) AS groups_list
+            FROM homework_status hs
+            JOIN planned_lessons pl ON pl.id = hs.planned_lesson_id
+            JOIN groups g ON g.id = pl.group_id
+            WHERE hs.is_done = 0
+              AND pl.homework_due_date != ''
+              AND pl.homework_due_date < ?
+        """, (today_iso,)).fetchone()
+        if overdue and overdue["n"]:
+            items.append({
+                "kind": "homework_overdue",
+                "emoji": "🔴",
+                "title": f"Просрочено домашек: {overdue['n']} "
+                         f"у {overdue['students']} учеников",
+                "detail": f"Группы: {overdue['groups_list'] or '—'}",
+                "action_label": "Открыть аналитику",
+                "action": {"nav": "Аналитика"},
+            })
+
+        # 4) Наблюдения ИИ, ждущие проверки
+        pending_obs = con.execute("""
+            SELECT COUNT(*) AS n FROM observations
+            WHERE status = 'Требует проверки'
+        """).fetchone()["n"]
+        if pending_obs:
+            items.append({
+                "kind": "pending_observations",
+                "emoji": "🟡",
+                "title": f"Наблюдений ждут проверки: {pending_obs}",
+                "detail": "Подтвердите или отклоните их в карточке урока.",
+                "action_label": "Открыть уроки",
+                "action": {"nav": "Уроки и транскрипты"},
+            })
+
+        # 5) Учебники, привязанные к группе, но без разобранных уроков
+        unparsed = con.execute("""
+            SELECT b.id, b.title, g.name AS group_name
+            FROM group_books gb
+            JOIN library_books b ON b.id = gb.book_id
+            JOIN groups g ON g.id = gb.group_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM book_chapters c WHERE c.book_id = b.id
+            )
+            ORDER BY b.title
+            LIMIT 5
+        """).fetchall()
+        for r in unparsed:
+            items.append({
+                "kind": "unparsed_book",
+                "emoji": "📖",
+                "title": f"«{r['title']}» привязан к {r['group_name']}, но уроки не разобраны",
+                "detail": "Запустите анализ книги в режиме «Задания».",
+                "action_label": "Открыть библиотеку",
+                "action": {"nav": "Библиотека", "set_state": {"book_tasks_id": r["id"]}},
+            })
+
+        # 6) Дубликаты учеников (по транслиту)
+        all_students = con.execute("SELECT id, name FROM students").fetchall()
+
+    # Дубликаты ищем в Python — по транслиту
+    seen: dict[str, list[dict]] = {}
+    for s in all_students:
+        key = translit_ru_to_lat(normalize_name(s["name"]))
+        key = re.sub(r"[^a-z0-9]", "", key)
+        if key:
+            seen.setdefault(key, []).append({"id": s["id"], "name": s["name"]})
+    dups = [v for v in seen.values() if len(v) > 1]
+    if dups:
+        names = "; ".join(" / ".join(x["name"] for x in d) for d in dups[:3])
+        items.append({
+            "kind": "student_duplicates",
+            "emoji": "🟠",
+            "title": f"Возможные дубликаты учеников: {len(dups)}",
+            "detail": names + ("…" if len(dups) > 3 else ""),
+            "action_label": "Открыть учеников",
+            "action": {"nav": "Ученики"},
+        })
+
+    return items
+
+
 # ---------- Группы ----------
 def list_groups():
     with db() as con:
@@ -2055,6 +2198,36 @@ if page == "Обзор":
       <p>Рабочее пространство для анализа уроков, наблюдений и прогресса учеников.</p>
     </div>
     """, unsafe_allow_html=True)
+
+    # ---- «Требует внимания» ----
+    attention = get_today_attention_items()
+    if attention:
+        st.markdown("### 🎯 Требует внимания")
+        for item in attention:
+            col_icon, col_text, col_btn = st.columns([1, 8, 2])
+            with col_icon:
+                st.markdown(
+                    f"<div style='font-size:1.6rem;text-align:center;"
+                    f"padding-top:.35rem'>{item['emoji']}</div>",
+                    unsafe_allow_html=True,
+                )
+            with col_text:
+                st.markdown(f"**{item['title']}**")
+                st.caption(item["detail"])
+            with col_btn:
+                if st.button(
+                    item["action_label"],
+                    key=f"attention_btn_{item['kind']}_{abs(hash(item['title'])) % 100000}",
+                    use_container_width=True,
+                ):
+                    target = item["action"].get("nav")
+                    if target:
+                        st.session_state["pending_nav"] = target
+                        for k, v in item["action"].get("set_state", {}).items():
+                            st.session_state[k] = v
+                        st.rerun()
+        st.divider()
+
     students, lessons, segments, observations = get_counts()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Ученики", students)
