@@ -850,6 +850,29 @@ def get_group_book_by_name(group_name):
         return get_group_book(row["id"])
 
 
+def get_group_book_by_name(group_name):
+    if not group_name:
+        return None
+    with db() as con:
+        row = con.execute("SELECT id FROM groups WHERE name=?", (group_name,)).fetchone()
+        if not row:
+            return None
+        return get_group_book(row["id"])
+
+
+def get_group_chapters_by_name(group_name) -> list[str]:
+    """Возвращает список названий глав привязанного к группе учебника."""
+    book = get_group_book_by_name(group_name)
+    if not book:
+        return []
+    with db() as con:
+        rows = con.execute(
+            "SELECT title FROM book_chapters WHERE book_id=? ORDER BY position, id",
+            (book["id"],),
+        ).fetchall()
+    return [r["title"] for r in rows]
+
+
 # ---------- Задания по книге: доступ к данным ----------
 def list_book_chapters(book_id):
     with db() as con:
@@ -1208,20 +1231,58 @@ def render_planned_card_editor(pl, *, key_prefix: str, compact: bool = False):
 
     # Учебник группы (бейдж)
     gbook = get_group_book_by_name(pl["group_name"]) if pl["group_name"] else None
+
     if gbook:
         st.markdown(
             f'<span class="hw-badge book">📖 {gbook["title"]}</span>',
             unsafe_allow_html=True
         )
 
-    topic_val = st.text_input(
-        "Тема",
-        value=pl["title"] or "",
-        key=f"{key_base}_title",
-        placeholder="Например: Lektion 05 — Reisen",
-        label_visibility="collapsed" if compact else "visible",
-    )
-    if topic_val != (pl["title"] or ""):
+    # Собираем варианты тем из учебника группы
+    chapter_titles = get_group_chapters_by_name(pl["group_name"]) if pl["group_name"] else []
+    current_title = pl["title"] or ""
+
+    # Формируем список опций: если тема уже задана и её нет в списке — добавим её первой
+    options = list(chapter_titles)
+    if current_title and current_title not in options:
+        options = [current_title] + options
+
+    if chapter_titles:
+        # Есть учебник с проанализированными уроками — даём выпадающий список
+        # с возможностью ввести своё значение.
+        try:
+            topic_val = st.selectbox(
+                "Тема (из учебника группы или своё название)",
+                options=options,
+                index=options.index(current_title) if current_title in options else 0,
+                key=f"{key_base}_title",
+                accept_new_options=True,
+                placeholder="Например: Lektion 05 — Reisen",
+                label_visibility="collapsed" if compact else "visible",
+            )
+        except TypeError:
+            # Старая версия Streamlit без accept_new_options — fallback на selectbox без ввода
+            topic_val = st.selectbox(
+                "Тема (из учебника группы)",
+                options=options,
+                index=options.index(current_title) if current_title in options else 0,
+                key=f"{key_base}_title",
+                label_visibility="collapsed" if compact else "visible",
+            )
+    else:
+        # Учебник не привязан или уроки ещё не выделены — обычное поле ввода
+        topic_val = st.text_input(
+            "Тема",
+            value=current_title,
+            key=f"{key_base}_title",
+            placeholder="Например: Lektion 05 — Reisen",
+            label_visibility="collapsed" if compact else "visible",
+        )
+
+    # Нормализуем: selectbox может вернуть None, если пользователь очистил поле
+    topic_val = (topic_val or "").strip()
+
+    if topic_val != current_title:
         update_planned(pl_id, title=topic_val)
         refresh_needed = True
 
