@@ -783,6 +783,32 @@ AI_SYSTEM_PROMPT = """Ты — ассистент преподавателя н�
 - `WHERE name LIKE '%<часть имени>%' COLLATE NOCASE`
 - транслит: «Анна» -> «Anna», «Лыкова» -> «Lykova»
 - инструмент `find_student`, который сам делает нечёткое сопоставление.
+
+ИНСТРУМЕНТ УДАЛЕНИЯ ЗАНЯТИЙ: `delete_planned_lesson`.
+Он удаляет карточку занятия из таблицы planned_lessons вместе со связанными
+записями homework_status. По умолчанию НЕ удаляет карточку, к которой уже
+привязан импортированный урок (lesson_id IS NOT NULL).
+
+Аргументы:
+- planned_lesson_id (integer) — точный id карточки (предпочтительно).
+- group_name (string) — часть имени группы (LIKE).
+- lesson_date (string) — дата в формате YYYY-MM-DD.
+- title (string) — часть названия темы (LIKE).
+- allow_with_lesson (boolean, default false) — разрешить удаление даже если
+  карточка связана с импортированным уроком.
+
+ПРАВИЛА работы с удалением:
+1. НИКОГДА не удаляй карточку, пока не проверил её через run_sql
+   (SELECT id, group_id, scheduled_at, title, lesson_id FROM planned_lessons ...).
+   Убедись, что это именно та карточка, о которой говорит пользователь.
+2. Предпочитай удаление по planned_lesson_id. Используй фильтры (group_name,
+   lesson_date, title) только если пользователь не знает id.
+3. Если найдено несколько кандидатов — не удаляй, а покажи их пользователю и
+   попроси уточнить.
+4. Если у карточки уже есть lesson_id — предупреди пользователя, что удаление
+   отвяжет карточку от загруженного урока. Удаляй только после явного
+   подтверждения пользователя и с allow_with_lesson=true.
+5. После удаления всегда возвращай отчёт: какой id, группа, дата, тема.
 """.replace("{teacher}", TEACHER_NAME)
 
 
@@ -899,6 +925,110 @@ def ai_find_student(query: str) -> dict:
 
     return {"candidates": [{"id": i, "name": n} for i, n in found.items()]}
 
+
+def ai_delete_planned_lesson(
+    planned_lesson_id: int | None = None,
+    group_name: str | None = None,
+    lesson_date: str | None = None,
+    title: str | None = None,
+    allow_with_lesson: bool = False,
+) -> dict:
+    """
+    Удаляет карточку занятия из planned_lessons.
+
+    Можно указать либо planned_lesson_id (точно), либо набор фильтров
+    (group_name, lesson_date, title) — в этом случае удалится ровно одна
+    подходящая карточка. Если под фильтр попадает больше одной или ни одной —
+    возвращаем ошибку и список кандидатов, чтобы модель уточнила запрос.
+
+    allow_with_lesson=False по умолчанию — защита от случайного удаления
+    карточки, к которой уже привязан импортированный урок (lesson_id IS NOT NULL).
+    """
+    def _row_to_dict(r):
+        return {
+            "id": r["id"],
+            "group_id": r["group_id"],
+            "group_name": r["group_name"],
+            "scheduled_at": r["scheduled_at"],
+            "title": r["title"],
+            "lesson_id": r["lesson_id"],
+        }
+
+    with db() as con:
+        # --- Сценарий 1: точный id ---
+        if planned_lesson_id:
+            row = con.execute("""
+                SELECT pl.*, g.name AS group_name
+                FROM planned_lessons pl
+                JOIN groups g ON g.id = pl.group_id
+                WHERE pl.id = ?
+            """, (int(planned_lesson_id),)).fetchone()
+            if not row:
+                return {"error": f"Карточка с id={planned_lesson_id} не найдена."}
+            if row["lesson_id"] and not allow_with_lesson:
+                return {
+                    "error": (
+                        "У карточки уже есть импортированный урок "
+                        f"(lesson_id={row['lesson_id']}). Чтобы удалить её "
+                        "принудительно, передай allow_with_lesson=true."
+                    ),
+                    "candidate": _row_to_dict(row),
+                }
+            con.execute("DELETE FROM planned_lessons WHERE id=?", (row["id"],))
+            return {"deleted": _row_to_dict(row)}
+
+        # --- Сценарий 2: поиск по фильтрам ---
+        if not any([group_name, lesson_date, title]):
+            return {
+                "error": (
+                    "Укажи либо planned_lesson_id, либо хотя бы один из фильтров: "
+                    "group_name, lesson_date (YYYY-MM-DD), title."
+                )
+            }
+
+        sql = """
+            SELECT pl.*, g.name AS group_name
+            FROM planned_lessons pl
+            JOIN groups g ON g.id = pl.group_id
+            WHERE 1=1
+        """
+        params: list = []
+        if group_name:
+            sql += " AND g.name LIKE ?"
+            params.append(f"%{group_name}%")
+        if lesson_date:
+            sql += " AND date(pl.scheduled_at) = date(?)"
+            params.append(lesson_date)
+        if title:
+            sql += " AND pl.title LIKE ?"
+            params.append(f"%{title}%")
+        sql += " ORDER BY pl.scheduled_at"
+        rows = con.execute(sql, params).fetchall()
+
+        if not rows:
+            return {"error": "По заданным фильтрам ничего не найдено."}
+
+        if len(rows) > 1:
+            return {
+                "error": (
+                    f"Найдено {len(rows)} карточек. Уточни запрос или передай "
+                    "planned_lesson_id конкретной записи."
+                ),
+                "candidates": [_row_to_dict(r) for r in rows[:20]],
+            }
+
+        row = rows[0]
+        if row["lesson_id"] and not allow_with_lesson:
+            return {
+                "error": (
+                    "У найденной карточки уже есть импортированный урок "
+                    f"(lesson_id={row['lesson_id']}). Если точно хочешь удалить — "
+                    "передай allow_with_lesson=true."
+                ),
+                "candidate": _row_to_dict(row),
+            }
+        con.execute("DELETE FROM planned_lessons WHERE id=?", (row["id"],))
+        return {"deleted": _row_to_dict(row)}
 
 def ai_run_sql(query: str, limit: int = 200) -> dict:
     if not isinstance(query, str) or not query.strip():
@@ -1053,6 +1183,45 @@ def ai_chat_step(messages: list[dict], max_tool_rounds: int = 4) -> str:
                 required=["query"],
             ),
         ),
+        Function(
+            name="delete_planned_lesson",
+            description=(
+                "Удалить карточку занятия из planned_lessons вместе со связанными "
+                "homework_status. Можно указать planned_lesson_id (точно) либо "
+                "фильтры group_name/lesson_date/title. По умолчанию не удаляет "
+                "карточку, к которой уже привязан импортированный урок "
+                "(lesson_id IS NOT NULL) — для этого нужен allow_with_lesson=true."
+            ),
+            parameters=FunctionParameters(
+                type="object",
+                properties={
+                    "planned_lesson_id": {
+                        "type": "integer",
+                        "description": "Точный id карточки занятия.",
+                    },
+                    "group_name": {
+                        "type": "string",
+                        "description": "Часть имени группы (LIKE).",
+                    },
+                    "lesson_date": {
+                        "type": "string",
+                        "description": "Дата занятия в формате YYYY-MM-DD.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Часть названия темы (LIKE).",
+                    },
+                    "allow_with_lesson": {
+                        "type": "boolean",
+                        "description": (
+                            "true — разрешить удаление карточки, к которой уже "
+                            "привязан импортированный урок. По умолчанию false."
+                        ),
+                    },
+                },
+                required=[],
+            ),
+        ),
     ]
 
     working = list(messages)
@@ -1103,6 +1272,14 @@ def ai_chat_step(messages: list[dict], max_tool_rounds: int = 4) -> str:
                 result = ai_run_sql(args.get("query", ""), args.get("limit", 200))
             elif name == "find_student":
                 result = ai_find_student(args.get("query", ""))
+            elif name == "delete_planned_lesson":
+                result = ai_delete_planned_lesson(
+                    planned_lesson_id=args.get("planned_lesson_id"),
+                    group_name=args.get("group_name"),
+                    lesson_date=args.get("lesson_date"),
+                    title=args.get("title"),
+                    allow_with_lesson=bool(args.get("allow_with_lesson", False)),
+                )
             else:
                 result = {"error": f"Неизвестный инструмент: {name}"}
             working.append({
